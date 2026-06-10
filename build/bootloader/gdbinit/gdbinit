@@ -1,0 +1,2 @@
+source D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/gdbinit/symbols
+source D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/gdbinit/connect

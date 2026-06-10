@@ -1,0 +1,7 @@
+CMake Error at C:/Espressif/frameworks/esp-idf-v5.4.1/tools/cmake/component.cmake:285 (message):
+  SRC_DIRS entry 'LCD' does not exist.
+Call Stack (most recent call first):
+  C:/Espressif/frameworks/esp-idf-v5.4.1/tools/cmake/component.cmake:454 (__component_add_sources)
+  components/BSP/CMakeLists.txt:18 (idf_component_register)
+
+
