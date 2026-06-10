@@ -1,4 +1,4 @@
-# Install script for directory: D:/WiFi/communication_routines/03_WiFi_AP/main
+# Install script for directory: D:/Fork/WiFi_USB_SD/main
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

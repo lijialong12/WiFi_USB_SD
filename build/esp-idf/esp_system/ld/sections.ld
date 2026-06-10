@@ -1,6 +1,6 @@
 /* Automatically generated file; DO NOT EDIT */
 /* Espressif IoT Development Framework Linker Script */
-/* Generated from: D:\WiFi\communication_routines\03_WiFi_AP\build\esp-idf\esp_system\ld\sections.ld.in */
+/* Generated from: D:\Fork\WiFi_USB_SD\build\esp-idf\esp_system\ld\sections.ld.in */
 
 /*
 

@@ -1,4 +1,4 @@
-/* * Data converted from D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/mbedtls/x509_crt_bundle
+/* * Data converted from D:/Fork/WiFi_USB_SD/build/esp-idf/mbedtls/x509_crt_bundle
  */
 .data
 #if !defined (__APPLE__) && !defined (__linux__)

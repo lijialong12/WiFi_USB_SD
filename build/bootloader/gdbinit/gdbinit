@@ -1,2 +1,2 @@
-source D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/gdbinit/symbols
-source D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/gdbinit/connect
+source D:/Fork/WiFi_USB_SD/build/bootloader/gdbinit/symbols
+source D:/Fork/WiFi_USB_SD/build/bootloader/gdbinit/connect

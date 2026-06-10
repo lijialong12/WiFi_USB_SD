@@ -39,10 +39,10 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for each subdirectory.
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/mbedtls/mbedtls/include/cmake_install.cmake")
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/mbedtls/mbedtls/3rdparty/cmake_install.cmake")
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/mbedtls/mbedtls/library/cmake_install.cmake")
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/mbedtls/mbedtls/pkgconfig/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/mbedtls/mbedtls/include/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/mbedtls/mbedtls/3rdparty/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/mbedtls/mbedtls/library/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/mbedtls/mbedtls/pkgconfig/cmake_install.cmake")
 
 endif()
 

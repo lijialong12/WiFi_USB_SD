@@ -39,6 +39,6 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/esp_system/port/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/esp_system/port/cmake_install.cmake")
 endif()
 

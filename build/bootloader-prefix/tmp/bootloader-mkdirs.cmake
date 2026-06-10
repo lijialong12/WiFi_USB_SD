@@ -10,18 +10,18 @@ if(NOT EXISTS "C:/Espressif/frameworks/esp-idf-v5.4.1/components/bootloader/subp
   file(MAKE_DIRECTORY "C:/Espressif/frameworks/esp-idf-v5.4.1/components/bootloader/subproject")
 endif()
 file(MAKE_DIRECTORY
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader"
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix"
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/tmp"
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/src/bootloader-stamp"
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/src"
-  "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/src/bootloader-stamp"
+  "D:/Fork/WiFi_USB_SD/build/bootloader"
+  "D:/Fork/WiFi_USB_SD/build/bootloader-prefix"
+  "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/tmp"
+  "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/src/bootloader-stamp"
+  "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/src"
+  "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/src/bootloader-stamp"
 )
 
 set(configSubDirs )
 foreach(subDir IN LISTS configSubDirs)
-    file(MAKE_DIRECTORY "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
+    file(MAKE_DIRECTORY "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
 endforeach()
 if(cfgdir)
-  file(MAKE_DIRECTORY "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
+  file(MAKE_DIRECTORY "D:/Fork/WiFi_USB_SD/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
 endif()

@@ -1,4 +1,4 @@
-# Install script for directory: D:/WiFi/communication_routines/03_WiFi_AP/components/BSP
+# Install script for directory: D:/Fork/WiFi_USB_SD/components/BSP
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

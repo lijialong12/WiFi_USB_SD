@@ -39,7 +39,7 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/esp-idf/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/cmake_install.cmake")
 endif()
 
 if(CMAKE_INSTALL_COMPONENT)
@@ -57,6 +57,6 @@ endif()
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-  file(WRITE "D:/WiFi/communication_routines/03_WiFi_AP/build/bootloader/${CMAKE_INSTALL_MANIFEST}"
+  file(WRITE "D:/Fork/WiFi_USB_SD/build/bootloader/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()

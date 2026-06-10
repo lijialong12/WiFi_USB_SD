@@ -1,4 +1,4 @@
-# Install script for directory: D:/WiFi/communication_routines/03_WiFi_AP
+# Install script for directory: D:/Fork/WiFi_USB_SD
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -39,7 +39,7 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for each subdirectory.
-  include("D:/WiFi/communication_routines/03_WiFi_AP/build/esp-idf/cmake_install.cmake")
+  include("D:/Fork/WiFi_USB_SD/build/esp-idf/cmake_install.cmake")
 
 endif()
 
@@ -58,6 +58,6 @@ endif()
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-  file(WRITE "D:/WiFi/communication_routines/03_WiFi_AP/build/${CMAKE_INSTALL_MANIFEST}"
+  file(WRITE "D:/Fork/WiFi_USB_SD/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()
