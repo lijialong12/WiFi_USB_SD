@@ -1,189 +1,216 @@
 /**
  ****************************************************************************************************
  * @file        main.c
- * @author      ONE 
+ * @author      ONE
  * @version     V1.0
  * @date        2026-06-11
- * @brief       USB MSC(大容量存储)驱动代码
+ * @brief       主程序入口 - USB MSC(大容量存储) + WiFi AP 综合应用
+ *              功能: ①初始化SD卡(SDMMC 4-bit模式) → ②注册USB MSC设备 →
+ *                    ③启动WiFi AP热点 → ④主循环LED状态指示
  * @license     重庆博士康科技有限公司版权所有
  ****************************************************************************************************
  * @attention
  *
  * 实验平台: ESP32-S3 WIFI USB SD卡 开发板
- * @note        
+ * 硬件连接: SD_CLK=GPIO36, SD_CMD=GPIO35, SD_D0~D3=GPIO37/38/33/34
+ *           USB_OTG: D-=GPIO19, D+=GPIO20
+ *           LED: GPIO1
+ * 工作流程: 上电 → LED亮 → 等待3秒USB枚举 → SD初始化 → USB MSC注册 →
+ *           WiFi AP启动 → LED闪烁(慢闪=SD正常, 快闪=SD失败)
+ * @note
  *
  ****************************************************************************************************
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "led.h"
-#include "sd_card.h"
-#include "usb_msc.h"
+/* ======================== 头文件包含 ======================== */
+#include <stdio.h>                          /* 标准I/O: printf, setvbuf */
+#include <stdlib.h>                         /* 标准库: malloc, free (间接使用) */
+#include <string.h>                         /* 字符串操作: strlen */
+#include "freertos/FreeRTOS.h"              /* FreeRTOS内核: 任务调度、延时 */
+#include "freertos/task.h"                  /* FreeRTOS任务API: vTaskDelay */
+#include "freertos/event_groups.h"          /* FreeRTOS事件组: 任务同步(保留) */
+#include "esp_system.h"                     /* ESP32系统API: 芯片信息 */
+#include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
+#include "nvs_flash.h"                      /* NVS(非易失性存储) Flash: WiFi配置存储 */
+#include "esp_wifi.h"                       /* ESP32 WiFi驱动: AP/STA模式 */
+#include "esp_event.h"                      /* ESP-IDF事件循环: WiFi事件处理 */
+#include "led.h"                            /* BSP-LED驱动: LED初始化/控制宏 */
+#include "sd_card.h"                        /* BSP-SD卡驱动: SDMMC初始化/反初始化 */
+#include "usb_msc.h"                        /* BSP-USB MSC驱动: USB大容量存储设备 */
 
 
-static const char *TAG = "AP";
-#define EXAMPLE_ESP_WIFI_SSID   "123"
-#define EXAMPLE_ESP_WIFI_PASS   "123456789"
-#define EXAMPLE_MAX_STA_CONN    5
-#define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
-#define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"
+/* ======================== WiFi AP 配置 ======================== */
+static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
+#define EXAMPLE_ESP_WIFI_SSID   "BOSSCOM_USB_AP"    /* WiFi AP热点名称(SSID) */
+#define EXAMPLE_ESP_WIFI_PASS   "012345678"         /* WiFi AP密码(至少8位) */
+#define EXAMPLE_MAX_STA_CONN    5                    /* AP最大同时连接客户端数 */
+#define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]  /* MAC地址拆分为6字节(用于printf) */
+#define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"                      /* MAC地址格式化字符串 */
 
 
 /**
- * @brief       WIFI事件处理函数
- * @param       arg:传入网卡控制块
- * @param       event_base:WIFI事件
- * @param       event_id:事件ID
- * @param       event_data:事件数据
+ * @brief       WiFi事件处理回调函数
+ *              处理STA(客户端)连接/断开事件, 打印客户端MAC地址和AID
+ * @param       arg: 用户自定义参数(本处未使用, 注册时传NULL)
+ * @param       event_base: 事件基类(WIFI_EVENT / IP_EVENT 等)
+ * @param       event_id: 具体事件ID(如WIFI_EVENT_AP_STACONNECTED)
+ * @param       event_data: 事件携带的数据(如wifi_event_ap_staconnected_t结构体指针)
  * @retval      无
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    /* 设备连接 */
-    if (event_id == WIFI_EVENT_AP_STACONNECTED)
+    /* ---------- 事件: 有STA客户端连接到AP ---------- */
+    if (event_id == WIFI_EVENT_AP_STACONNECTED)                         /* 判断事件类型: 客户端连接 */
     {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d",
-                 MAC2STR(event->mac), event->aid);
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data; /* 提取连接事件数据结构(含MAC/AID) */
+        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d",               /* 打印日志: 客户端MAC地址和关联ID */
+                 MAC2STR(event->mac), event->aid);                      /* MAC2STR展开6字节MAC, event->aid是关联标识符 */
     }
-    /* 设备断开 */
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    /* ---------- 事件: 有STA客户端从AP断开 ---------- */
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)                 /* 判断事件类型: 客户端断开 */
     {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d",
-                 MAC2STR(event->mac), event->aid);
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data; /* 提取断开事件数据结构 */
+        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d",              /* 打印日志: 断开客户端的MAC和AID */
+                 MAC2STR(event->mac), event->aid);                      /* MAC2STR展开MAC地址字节 */
     }
 }
 
 /**
- * @brief       WIFI初始化
+ * @brief       WiFi SoftAP(软接入点)初始化函数
+ *              配置ESP32-S3为WiFi热点模式, 允许其他设备连接
+ *              步骤: ①初始化TCP/IP协议栈 → ②创建事件循环 → ③创建默认AP网卡 →
+ *                    ④初始化WiFi驱动 → ⑤注册事件回调 → ⑥配置SSID/密码 →
+ *                    ⑦设置为AP模式 → ⑧启动WiFi
  * @param       无
  * @retval      无
  */
 static void wifi_init_softap(void)
 {
-    /* 初始化网卡 */
-    ESP_ERROR_CHECK(esp_netif_init());
+    /* 步骤1: 初始化TCP/IP网络协议栈(netif层) */
+    ESP_ERROR_CHECK(esp_netif_init());                                  /* 初始化LwIP网络接口, 必须最先调用 */
 
-    /* 创建新的事件循环 */
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    /* 使用默认配置初始化包括netif的Wi-Fi */
-    esp_netif_create_default_wifi_ap();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    /* 步骤2: 创建系统默认事件循环(用于WiFi/IP事件分发) */
+    ESP_ERROR_CHECK(esp_event_loop_create_default());                   /* 创建默认事件循环, WiFi事件通过此循环投递到回调 */
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    /* 配置WIFI */
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = EXAMPLE_ESP_WIFI_SSID,
-            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
-            .password = EXAMPLE_ESP_WIFI_PASS,
-            .max_connection = EXAMPLE_MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+    /* 步骤3: 使用默认配置创建WiFi AP网络接口 */
+    esp_netif_create_default_wifi_ap();                                 /* 创建并注册默认的WiFi AP netif实例(WIFI_AP_DEF) */
+
+    /* 步骤4: 初始化WiFi驱动(分配资源、配置PHY) */
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();                /* 获取WiFi初始化的默认配置(含操作系统相关参数) */
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));                               /* 用默认配置初始化WiFi硬件驱动层 */
+
+    /* 步骤5: 注册WiFi事件处理回调(监听所有WiFi事件) */
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL)); /* 注册回调: 匹配所有WIFI_EVENT */
+
+    /* 步骤6: 配置AP参数(SSID、密码、加密方式、最大连接数) */
+    wifi_config_t wifi_config = {                                       /* 定义WiFi配置结构体(使用C99指定初始化器) */
+        .ap = {                                                         /* AP模式专用配置字段 */
+            .ssid = EXAMPLE_ESP_WIFI_SSID,                              /* 设置WiFi热点名称 */
+            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),                  /* 设置SSID字符串长度 */
+            .password = EXAMPLE_ESP_WIFI_PASS,                          /* 设置WiFi密码 */
+            .max_connection = EXAMPLE_MAX_STA_CONN,                     /* 设置最大同时连接数(硬件限制通常为4~10) */
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK                         /* 设置加密认证模式: WPA/WPA2-PSK混合 */
         },
     };
 
-    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0)
+    /* 步骤7: 如果密码为空, 则设置为开放网络(无加密) */
+    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0)                             /* 判断密码长度是否为0 */
     {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;                       /* 设为开放模式(Open), 不需要密码即可连接 */
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    /* 步骤8: 设置WiFi工作模式为AP并应用配置 */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));                   /* 设置WiFi模式为纯AP(接入点)模式 */
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config)); /* 将SSID/密码等配置应用到AP接口 */
+    ESP_ERROR_CHECK(esp_wifi_start());                                  /* 启动WiFi硬件, AP开始广播Beacon帧 */
 
-    esp_netif_ip_info_t ip_info;
-    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip_info);
+    /* 步骤9: 获取并打印AP的IP地址信息 */
+    esp_netif_ip_info_t ip_info;                                        /* 定义IP信息结构体(含IP/网关/掩码) */
+    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip_info); /* 通过接口键名获取netif句柄, 再读取IP信息 */
 
-    ESP_LOGI(TAG, "Set up softAP with IP: " IPSTR, IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "Set up softAP with IP: " IPSTR, IP2STR(&ip_info.ip)); /* 打印AP的IPv4地址(默认192.168.4.1) */
 
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:'%s' password:'%s'",
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:'%s' password:'%s'", /* 打印WiFi AP配置完成信息 */
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);             /* 输出SSID和密码供调试确认 */
 }
 
 /**
- * @brief       程序入口
+ * @brief       应用程序主入口(app_main)
+ *              ESP-IDF自动调用, 等价于C标准main()函数
+ *              初始化顺序: NVS → LED → 等待USB枚举 → SD卡 → USB MSC → WiFi AP → 主循环
  * @param       无
- * @retval      无
+ * @retval      无(FreeRTOS任务中永不返回)
  */
 void app_main(void)
 {
-    esp_err_t ret;
+    esp_err_t ret;                                                      /* ESP-IDF错误码变量(ESP_OK=0表示成功) */
 
-    /* 先初始化NVS和LED (不需要串口) */
-    ret = nvs_flash_init();
+    /* ===== 阶段0: NVS Flash初始化(存储WiFi配置等非易失数据) ===== */
+    ret = nvs_flash_init();                                             /* 初始化NVS(非易失性存储)分区 */
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) /* 如果NVS分区已满或版本不兼容 */
     {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+        ESP_ERROR_CHECK(nvs_flash_erase());                             /* 擦除整个NVS分区(清除旧数据) */
+        ret = nvs_flash_init();                                         /* 重新初始化NVS(此时应为空) */
     }
 
-    led_init();
-    LED(0);  /* 点亮LED表示上电 */
+    /* ===== 阶段0.5: LED初始化(最早的视觉反馈) ===== */
+    led_init();                                                         /* 初始化GPIO1为LED控制引脚(输入输出模式+上拉) */
+    LED(1);                                                             /* 点亮LED(高电平), 表示系统已上电启动 */
 
-    /* 等待USB Serial/JTAG枚举完成 (LED常亮约3秒) */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* ===== 阶段0.7: 等待USB Serial/JTAG枚举完成 ===== */
+    vTaskDelay(pdMS_TO_TICKS(3000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
 
-    /* USB已就绪, 以下printf均可见 */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* ===== 阶段0.8: 重定向标准输出 ===== */
+    setvbuf(stdout, NULL, _IONBF, 0);                                   /* 设置stdout为无缓冲模式(printf立即输出, 不掉数据) */
 
-    printf("\n\n========== WiFi_USB_SD Starting ==========\n");
-    printf("Chip: ESP32-S3 | SD: SDMMC 1-bit(CLK=36,CMD=35,D0=37)\n\n");
+    /* 打印启动横幅 */
+    printf("\n\n========== WiFi_USB_SD Starting ==========\n");         /* 输出启动分隔线和项目名称 */
+    printf("Chip: ESP32-S3 | SD: SDMMC 1-bit(CLK=36,CMD=35,D0=37)\n\n"); /* 输出芯片型号和SD卡引脚映射信息 */
 
-    /* ---- SD卡初始化 ---- */
-    printf("[MAIN] Step 1/3: SD card init...\n");
-    sdmmc_card_t *sd_card = NULL;
-    esp_err_t sd_ret = sd_card_init(&sd_card);
+    /* ===== 阶段1: SD卡初始化(SDMMC 4-bit模式, 40MHz) ===== */
+    printf("[MAIN] Step 1/3: SD card init...\n");                       /* 输出进度: 第1步SD卡初始化 */
+    sdmmc_card_t *sd_card = NULL;                                       /* 定义SD卡控制块指针(初始为空) */
+    esp_err_t sd_ret = sd_card_init(&sd_card);                          /* 调用BSP驱动初始化SD卡, 获取操作结果和卡控制块 */
 
-    if (sd_ret == ESP_OK && sd_card != NULL)
+    if (sd_ret == ESP_OK && sd_card != NULL)                            /* 判断SD卡是否初始化成功(返回值OK且指针有效) */
     {
-        printf("[MAIN] Step 2/3: USB MSC init...\n");
-        ESP_ERROR_CHECK(usb_msc_init(sd_card));
-        ESP_ERROR_CHECK(usb_msc_mount("/sd"));
-        printf("[MAIN] USB MSC ready! Plug USB OTG cable to PC.\n");
+        /* SD卡就绪 → 初始化USB MSC大容量存储设备 */
+        printf("[MAIN] Step 2/3: USB MSC init...\n");                   /* 输出进度: 第2步USB MSC初始化 */
+        ESP_ERROR_CHECK(usb_msc_init(sd_card));                         /* 注册SD卡为USB大容量存储设备(TinyUSB MSC) */
+        ESP_ERROR_CHECK(usb_msc_mount("/sd"));                          /* 挂载SD卡文件系统到"/sd"路径(ESP32本地可读写) */
+        printf("[MAIN] USB MSC ready! Plug USB OTG cable to PC.\n");   /* 提示: 用USB OTG线连接电脑即可识别为U盘 */
     }
-    else
+    else                                                                /* SD卡初始化失败 */
     {
-        printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret);
-        printf("[MAIN] USB MSC will NOT be available (no SD card)\n");
+        printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret); /* 输出失败原因(错误名和错误码) */
+        printf("[MAIN] USB MSC will NOT be available (no SD card)\n");  /* 提示: 因无SD卡, USB MSC功能不可用 */
     }
 
-    /* ---- WiFi AP 初始化 ---- */
-    printf("[MAIN] Step 3/3: WiFi AP init...\n");
-    wifi_init_softap();
-    printf("[MAIN] WiFi AP: SSID='123' PASS='123456789'\n");
+    /* ===== 阶段2: WiFi AP 初始化 ===== */
+    printf("[MAIN] Step 3/3: WiFi AP init...\n");                       /* 输出进度: 第3步WiFi AP初始化 */
+    wifi_init_softap();                                                 /* 启动WiFi SoftAP: SSID='BOSSCOM_USB_AP' */
+    printf("[MAIN] WiFi AP: SSID='BOSSCOM_USB_AP' PASS='012345678'\n"); /* 输出WiFi AP的SSID和密码供用户连接 */
 
-    /* ---- 主循环 ---- */
-    bool sd_ok = (sd_ret == ESP_OK);
-    int loop_count = 0;
-    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow(SD_OK)" : "fast(no_SD)");
-    LED(1);  /* 熄灭LED, 进入闪烁模式 */
+    /* ===== 阶段3: 主循环(LED状态指示 + 周期日志) ===== */
+    bool sd_ok = (sd_ret == ESP_OK);                                    /* 缓存SD卡状态: true=正常, false=失败 */
+    int loop_count = 0;                                                 /* 循环计数器(用于控制日志输出频率) */
+    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow(SD_OK)" : "fast(no_SD)"); /* 输出LED闪烁模式说明 */
+    LED(0);                                                             /* 熄灭LED, 进入主循环闪烁模式 */
 
-    while (1)
+    while (1)                                                           /* 无限主循环(FreeRTOS任务永不退出) */
     {
-        LED_TOGGLE();
+        LED_TOGGLE();                                                   /* 翻转LED电平(亮→灭 或 灭→亮) */
 
-        if (++loop_count >= 25)
+        if (++loop_count >= 25)                                         /* 每25次循环(约5秒或2.5秒)打印一次日志 */
         {
-            loop_count = 0;
-            printf("[LOOP] LED=%s SD=%s(%d)\n",
-                   sd_ok ? "slow" : "fast",
-                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret);
+            loop_count = 0;                                             /* 重置循环计数器 */
+            printf("[LOOP] LED=%s SD=%s(%d)\n",                         /* 输出当前状态: LED闪烁速度 + SD卡状态 */
+                   sd_ok ? "slow" : "fast",                             /* SD正常时200ms周期→慢闪; 失败时100ms周期→快闪 */
+                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret);    /* 输出SD卡状态(OK或错误名和错误码) */
         }
 
-        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));
+        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));   /* 延时: SD正常=200ms → 慢闪; SD失败=100ms → 快闪告警 */
     }
 }
