@@ -162,12 +162,6 @@ esp_err_t usb_msc_mount(const char *base_path)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (tinyusb_msc_storage_in_use_by_usb_host())
-    {
-        ESP_LOGW(TAG, "Storage is in use by USB host, cannot mount for local access");
-        return ESP_ERR_INVALID_STATE;
-    }
-
     ESP_LOGI(TAG, "Mounting storage at %s...", base_path);
     ESP_ERROR_CHECK(tinyusb_msc_storage_mount(base_path));
     ESP_LOGI(TAG, "Storage mounted at %s", base_path);

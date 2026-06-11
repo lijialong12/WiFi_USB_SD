@@ -5,6 +5,9 @@
  */
 
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
@@ -34,14 +37,21 @@ static const char *TAG = "tinyusb_msc_storage";
 #endif
 
 /**
- * @brief Structure representing a single write buffer for MSC operations.
+ * @brief Structure representing a write buffer for MSC operations.
+ *
+ * Two of these are allocated in the storage handle for double-buffering:
+ * while one buffer is being written to storage, the other can receive
+ * the next USB transfer, resulting in smooth linear transfer progress.
  */
 typedef struct {
     uint8_t data_buffer[MSC_STORAGE_BUFFER_SIZE]; /*!< Buffer to store write data. The size is defined by MSC_STORAGE_BUFFER_SIZE. */
     uint32_t lba;                          /*!< Logical Block Address for the current WRITE10 operation. */
     uint32_t offset;                       /*!< Offset within the specified LBA for the current write operation. */
     uint32_t bufsize;                      /*!< Number of bytes to be written in this operation. */
+    volatile bool busy;                    /*!< True while this buffer's data is being written to storage. */
 } msc_storage_buffer_t;
+
+#define MSC_STORAGE_BUF_COUNT 4            /*!< Number of write buffers for pipelined writes */
 
 /**
  * @brief Handle for TinyUSB MSC storage interface.
@@ -50,8 +60,10 @@ typedef struct {
  * manage the underlying storage medium (SPI flash, SDMMC).
  */
 typedef struct {
-    msc_storage_buffer_t storage_buffer;
+    msc_storage_buffer_t storage_buffer[MSC_STORAGE_BUF_COUNT]; /*!< Double-buffered write buffers (ping-pong). */
+    uint8_t cur_buf_idx;                  /*!< Index of the next buffer to use (0 or 1), round-robin. */
     bool is_fat_mounted;                  /*!< Indicates if the FAT filesystem is currently mounted. */
+    bool is_usb_mounted;                  /*!< Indicates if the USB host has claimed the storage. */
     const char *base_path;                /*!< Base path where the filesystem is mounted. */
     union {
         wl_handle_t wl_handle;            /*!< Handle for wear leveling on SPI flash. */
@@ -74,6 +86,65 @@ typedef struct {
 
 /* handle of tinyusb driver connected to application */
 static tinyusb_msc_storage_handle_s *s_storage_handle;
+
+/* Forward declaration — defined later in the file (after the storage read/write helpers) */
+static esp_err_t _msc_storage_write_sector(uint32_t lba, uint32_t offset, size_t size, const void *src);
+
+/* Dedicated writer task: decouples SD card writes from the USB device task.
+ * USB receives data into buffers; this task flushes them to storage in parallel. */
+static TaskHandle_t s_writer_task = NULL;
+static QueueHandle_t s_write_queue = NULL;
+#define MSC_WRITE_QUEUE_DEPTH  8
+#define MSC_WRITER_TASK_PRIO   3
+#define MSC_WRITER_STACK_SIZE  2048
+
+/**
+ * @brief Dedicated writer task — drains the write queue, flushing buffers to storage.
+ *
+ * Runs on a separate FreeRTOS task so that SD card writes never block the
+ * TinyUSB device task. This keeps USB transfers flowing at full speed
+ * regardless of SD card write latency.
+ */
+static void msc_writer_task(void *param)
+{
+    (void) param;
+    while (1) {
+        msc_storage_buffer_t *buf = NULL;
+        if (xQueueReceive(s_write_queue, &buf, portMAX_DELAY) == pdTRUE && buf != NULL) {
+            esp_err_t err = _msc_storage_write_sector(
+                                buf->lba, buf->offset, buf->bufsize,
+                                (const void *)buf->data_buffer
+                            );
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Write failed, error=0x%x", err);
+            }
+            buf->busy = false;  /* Buffer is now free for the next WRITE10 */
+        }
+    }
+}
+
+/**
+ * @brief Create the writer task and queue (called once during init).
+ */
+static esp_err_t _create_writer_resources(void)
+{
+    if (s_write_queue == NULL) {
+        s_write_queue = xQueueCreate(MSC_WRITE_QUEUE_DEPTH, sizeof(msc_storage_buffer_t *));
+        if (s_write_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create write queue");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_writer_task == NULL) {
+        BaseType_t ret = xTaskCreate(msc_writer_task, "msc_writer", MSC_WRITER_STACK_SIZE,
+                                     NULL, MSC_WRITER_TASK_PRIO, &s_writer_task);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create writer task");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
 
 static esp_err_t _mount_spiflash(BYTE pdrv)
 {
@@ -300,29 +371,6 @@ fail:
     return ret;
 }
 
-/**
- * @brief Handles deferred USB MSC write operations.
- *
- * This function is invoked via TinyUSB's deferred execution mechanism to perform
- * write operations to the underlying storage. It writes data from the
- * `storage_buffer` stored within the `s_storage_handle`.
- *
- * @param param Unused. Present for compatibility with deferred function signature.
- */
-static void _write_func(void *param)
-{
-    // Process the data in storage_buffer
-    esp_err_t err = _msc_storage_write_sector(
-                        s_storage_handle->storage_buffer.lba,
-                        s_storage_handle->storage_buffer.offset,
-                        s_storage_handle->storage_buffer.bufsize,
-                        (const void *)s_storage_handle->storage_buffer.data_buffer
-                    );
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Write failed, error=0x%x", err);
-    }
-}
-
 esp_err_t tinyusb_msc_storage_mount(const char *base_path)
 {
     esp_err_t ret = ESP_OK;
@@ -462,13 +510,23 @@ esp_err_t tinyusb_msc_storage_init_spiflash(const tinyusb_msc_spiflash_config_t 
     s_storage_handle->sector_size = _get_sector_size_spiflash();
     s_storage_handle->read = &_read_sector_spiflash;
     s_storage_handle->write = &_write_sector_spiflash;
+    s_storage_handle->cur_buf_idx = 0;
     s_storage_handle->is_fat_mounted = false;
+    s_storage_handle->is_usb_mounted = false;
     s_storage_handle->base_path = NULL;
     // In case the user does not set mount_config.max_files
     // and for backward compatibility with versions <1.4.2
     // max_files is set to 2
     const int max_files = config->mount_config.max_files;
     s_storage_handle->max_files = max_files > 0 ? max_files : 2;
+
+    /* Mark all write buffers as free */
+    for (int i = 0; i < MSC_STORAGE_BUF_COUNT; i++) {
+        s_storage_handle->storage_buffer[i].busy = false;
+    }
+
+    /* Create dedicated writer task + queue for parallel SD writes */
+    ESP_RETURN_ON_ERROR(_create_writer_resources(), TAG, "Failed to create writer resources");
 
     /* Callbacks setting up*/
     if (config->callback_mount_changed) {
@@ -482,7 +540,10 @@ esp_err_t tinyusb_msc_storage_init_spiflash(const tinyusb_msc_spiflash_config_t 
         tinyusb_msc_unregister_callback(TINYUSB_MSC_EVENT_PREMOUNT_CHANGED);
     }
 
-    if (!esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer.data_buffer)) {
+    if (!esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[0].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[1].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[2].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[3].data_buffer)) {
         ESP_LOGW(TAG, "storage buffer is not DMA capable");
     }
 
@@ -502,13 +563,23 @@ esp_err_t tinyusb_msc_storage_init_sdmmc(const tinyusb_msc_sdmmc_config_t *confi
     s_storage_handle->sector_size = _get_sector_size_sdmmc();
     s_storage_handle->read = &_read_sector_sdmmc;
     s_storage_handle->write = &_write_sector_sdmmc;
+    s_storage_handle->cur_buf_idx = 0;
     s_storage_handle->is_fat_mounted = false;
+    s_storage_handle->is_usb_mounted = false;
     s_storage_handle->base_path = NULL;
     // In case the user does not set mount_config.max_files
     // and for backward compatibility with versions <1.4.2
     // max_files is set to 2
     const int max_files = config->mount_config.max_files;
     s_storage_handle->max_files = max_files > 0 ? max_files : 2;
+
+    /* Mark all write buffers as free */
+    for (int i = 0; i < MSC_STORAGE_BUF_COUNT; i++) {
+        s_storage_handle->storage_buffer[i].busy = false;
+    }
+
+    /* Create dedicated writer task + queue for parallel SD writes */
+    ESP_RETURN_ON_ERROR(_create_writer_resources(), TAG, "Failed to create writer resources");
 
     /* Callbacks setting up*/
     if (config->callback_mount_changed) {
@@ -522,7 +593,10 @@ esp_err_t tinyusb_msc_storage_init_sdmmc(const tinyusb_msc_sdmmc_config_t *confi
         tinyusb_msc_unregister_callback(TINYUSB_MSC_EVENT_PREMOUNT_CHANGED);
     }
 
-    if (!esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer.data_buffer)) {
+    if (!esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[0].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[1].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[2].data_buffer) ||
+        !esp_ptr_dma_capable((const void *)s_storage_handle->storage_buffer[3].data_buffer)) {
         ESP_LOGW(TAG, "storage buffer is not DMA capable");
     }
 
@@ -532,6 +606,15 @@ esp_err_t tinyusb_msc_storage_init_sdmmc(const tinyusb_msc_sdmmc_config_t *confi
 
 void tinyusb_msc_storage_deinit(void)
 {
+    /* Stop writer task first so no more writes are processed */
+    if (s_writer_task != NULL) {
+        vTaskDelete(s_writer_task);
+        s_writer_task = NULL;
+    }
+    if (s_write_queue != NULL) {
+        vQueueDelete(s_write_queue);
+        s_write_queue = NULL;
+    }
     if (s_storage_handle) {
         heap_caps_free(s_storage_handle);
         s_storage_handle = NULL;
@@ -574,7 +657,7 @@ esp_err_t tinyusb_msc_unregister_callback(tinyusb_msc_event_type_t event_type)
 bool tinyusb_msc_storage_in_use_by_usb_host(void)
 {
     assert(s_storage_handle);
-    return !s_storage_handle->is_fat_mounted;
+    return s_storage_handle->is_usb_mounted;
 }
 
 
@@ -606,18 +689,16 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void) lun;
-    bool result = false;
 
     if (s_storage_handle->is_fat_mounted) {
-        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, SCSI_CODE_ASC_MEDIUM_NOT_PRESENT, SCSI_CODE_ASCQ);
-        result = false;
-    } else {
+        // Locally mounted: auto-unmount to give USB host access, then report ready
         if (tinyusb_msc_storage_unmount() != ESP_OK) {
             ESP_LOGW(TAG, "tud_msc_test_unit_ready_cb() unmount Fails");
+            return false;
         }
-        result = true;
+        s_storage_handle->is_usb_mounted = true;
     }
-    return result;
+    return true;
 }
 
 // Invoked when received SCSI_CMD_READ_CAPACITY_10 and SCSI_CMD_READ_FORMAT_CAPACITY to determine the disk size
@@ -664,19 +745,53 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 // Invoked when received SCSI WRITE10 command
 // - Address = lba * BLOCK_SIZE + offset
 // - Application write data from buffer to address contents (up to bufsize) and return number of written byte.
+//
+// Uses double-buffering: while one buffer is being written to storage (deferred),
+// the next WRITE10 can fill the other buffer immediately. This produces smooth,
+// linear transfer progress instead of stop-and-go.
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     assert(bufsize <= MSC_STORAGE_BUFFER_SIZE);
-    // Copy data to the buffer
-    memcpy((void *)s_storage_handle->storage_buffer.data_buffer, buffer, bufsize);
-    s_storage_handle->storage_buffer.lba = lba;
-    s_storage_handle->storage_buffer.offset = offset;
-    s_storage_handle->storage_buffer.bufsize = bufsize;
 
-    // Defer execution of the write to the TinyUSB task
-    usbd_defer_func(_write_func, NULL, false);
+    /* Find a free buffer (round-robin starting from current index) */
+    msc_storage_buffer_t *buf = NULL;
+    for (int i = 0; i < MSC_STORAGE_BUF_COUNT; i++) {
+        uint8_t idx = (s_storage_handle->cur_buf_idx + i) % MSC_STORAGE_BUF_COUNT;
+        if (!s_storage_handle->storage_buffer[idx].busy) {
+            buf = &s_storage_handle->storage_buffer[idx];
+            s_storage_handle->cur_buf_idx = (idx + 1) % MSC_STORAGE_BUF_COUNT;
+            break;
+        }
+    }
 
-    // Return the number of bytes accepted
+    if (buf == NULL) {
+        /* All buffers are still being written — should be rare with 4×4KB buffers.
+         * Stall the endpoint so the host retries later. */
+        ESP_LOGW(TAG, "All write buffers busy, stalling");
+        return 0;
+    }
+
+    /* Copy data from USB FIFO into our buffer */
+    memcpy((void *)buf->data_buffer, buffer, bufsize);
+    buf->lba = lba;
+    buf->offset = offset;
+    buf->bufsize = bufsize;
+    buf->busy = true;
+
+    /* Send buffer to the dedicated writer task via FreeRTOS queue.
+     * The writer task runs on a separate thread, so the USB task returns
+     * immediately and is ready for the next WRITE10. SD writes happen
+     * in parallel, completely decoupled from USB transfers. */
+    if (xQueueSend(s_write_queue, &buf, 0) != pdTRUE) {
+        /* Queue full — writer is backlogged. Stall the endpoint so the
+         * host retries; this avoids dropping data. */
+        buf->busy = false;
+        ESP_LOGW(TAG, "Write queue full, stalling");
+        return 0;
+    }
+
+    /* Return immediately — the host can send the next WRITE10 while
+     * the writer task flushes this buffer to storage in parallel. */
     return bufsize;
 }
 
@@ -716,17 +831,19 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
     return ret;
 }
 
-// Invoked when device is unmounted
+// Invoked when device is unmounted (USB disconnected)
 void tud_umount_cb(void)
 {
     if (tinyusb_msc_storage_mount(s_storage_handle->base_path) != ESP_OK) {
         ESP_LOGW(TAG, "tud_umount_cb() mount Fails");
     }
+    s_storage_handle->is_usb_mounted = false;
 }
 
-// Invoked when device is mounted (configured)
+// Invoked when device is mounted (configured by USB host)
 void tud_mount_cb(void)
 {
     tinyusb_msc_storage_unmount();
+    s_storage_handle->is_usb_mounted = true;
 }
 /*********************************************************************** TinyUSB MSC callbacks*/

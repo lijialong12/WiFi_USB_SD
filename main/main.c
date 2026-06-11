@@ -152,12 +152,13 @@ void app_main(void)
     {
         printf("[MAIN] Step 2/3: USB MSC init...\n");
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
-        usb_msc_mount("/sd");
+        ESP_ERROR_CHECK(usb_msc_mount("/sd"));
         printf("[MAIN] USB MSC ready! Plug USB OTG cable to PC.\n");
     }
     else
     {
         printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret);
+        printf("[MAIN] USB MSC will NOT be available (no SD card)\n");
     }
 
     /* ---- WiFi AP 初始化 ---- */

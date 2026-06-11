@@ -4,7 +4,7 @@
  * @author      ONE 
  * @version     V1.0
  * @date        2026-06-11
- * @brief       SD卡驱动代码(SDMMC 1-bit模式)
+ * @brief       SD卡驱动代码(SDMMC 4-bit高速模式)
  * @license     重庆博士康科技有限公司版权所有
  ****************************************************************************************************
  * @attention
@@ -27,15 +27,17 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
 {
     esp_err_t ret;
 
-    printf("[SD] Initializing SD card (SDMMC 1-bit mode)...\n");
+    printf("[SD] Initializing SD card (SDMMC 4-bit mode)...\n");
     printf("[SD]   CLK: GPIO%d\n", SD_CLK);
     printf("[SD]   CMD: GPIO%d\n", SD_CMD);
     printf("[SD]   D0 : GPIO%d\n", SD_D0);
+    printf("[SD]   D1 : GPIO%d\n", SD_D1);
+    printf("[SD]   D2 : GPIO%d\n", SD_D2);
+    printf("[SD]   D3 : GPIO%d\n", SD_D3);
 
-    /* SDMMC主机默认配置 */
+    /* SDMMC主机配置: 高速40MHz */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    /* 降低初始化时的时钟频率, 提高兼容性 */
-    host.max_freq_khz = SDMMC_FREQ_PROBING;  /* 400kHz */
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  /* 40MHz */
 
     /* SDMMC卡槽配置 */
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -44,9 +46,12 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
     slot_config.clk = SD_CLK;
     slot_config.cmd = SD_CMD;
     slot_config.d0  = SD_D0;
+    slot_config.d1  = SD_D1;
+    slot_config.d2  = SD_D2;
+    slot_config.d3  = SD_D3;
 
-    /* 1-bit模式 */
-    slot_config.width = 1;
+    /* 4-bit模式 */
+    slot_config.width = 4;
     /* 使能内部上拉 */
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
@@ -76,10 +81,13 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
     }
     printf("[SD] Slot init OK\n");
 
-    /* 增强GPIO驱动能力 (SD卡需要较强的驱动) */
+    /* 增强GPIO驱动能力 (高速SD卡需要较强的驱动) */
     gpio_set_drive_capability(SD_CLK, GPIO_DRIVE_CAP_3);  /* CLK需要最强驱动 */
     gpio_set_drive_capability(SD_CMD, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(SD_D0,  GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(SD_D1,  GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(SD_D2,  GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(SD_D3,  GPIO_DRIVE_CAP_3);
     printf("[SD] GPIO drive strength set to max\n");
 
     /* 分配并初始化SD卡 */
@@ -96,7 +104,7 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
         return ESP_ERR_NO_MEM;
     }
 
-    printf("[SD] Probing SD card (SDMMC, 400kHz)...\n");
+    printf("[SD] Probing SD card (SDMMC, 40MHz)...\n");
     ret = sdmmc_card_init(&host, card);
 
     if (ret != ESP_OK)
