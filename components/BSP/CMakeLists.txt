@@ -1,13 +1,17 @@
 set(src_dirs
-            IIC
-            LED)
+            LED
+            SD
+            USB)
 
 set(include_dirs
-            IIC
-            LED)
+            LED
+            SD
+            USB)
 
 set(requires
-            driver)
+            driver
+            esp_driver_sdmmc
+            esp_tinyusb)
 
 idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 

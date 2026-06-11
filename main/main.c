@@ -1,22 +1,19 @@
 /**
  ****************************************************************************************************
-* @file        main.c
-* @author      正点原子团队(ALIENTEK)
-* @version     V1.0
-* @date        2023-08-26
-* @brief       WiFi-AP 模式创建 wifi 热点实验
-* @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
-****************************************************************************************************
-* @attention
-*
-* 实验平台:正点原子 ESP32-S3 开发板
-* 在线视频:www.yuanzige.com
-* 技术论坛:www.openedv.com
-* 公司网址:www.alientek.com
-* 购买地址:openedv.taobao.com
-*
-****************************************************************************************************
-*/
+ * @file        main.c
+ * @author      ONE 
+ * @version     V1.0
+ * @date        2026-06-11
+ * @brief       USB MSC(大容量存储)驱动代码
+ * @license     重庆博士康科技有限公司版权所有
+ ****************************************************************************************************
+ * @attention
+ *
+ * 实验平台: ESP32-S3 WIFI USB SD卡 开发板
+ * @note        
+ *
+ ****************************************************************************************************
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +27,8 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "led.h"
+#include "sd_card.h"
+#include "usb_msc.h"
 
 
 static const char *TAG = "AP";
@@ -123,7 +122,8 @@ void app_main(void)
 {
     esp_err_t ret;
 
-    ret = nvs_flash_init();             /* 初始化NVS */
+    /* 先初始化NVS和LED (不需要串口) */
+    ret = nvs_flash_init();
 
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -131,12 +131,58 @@ void app_main(void)
         ret = nvs_flash_init();
     }
 
-    led_init();                         /* 初始化LED */
+    led_init();
+    LED(0);  /* 点亮LED表示上电 */
+
+    /* 等待USB Serial/JTAG枚举完成 (LED常亮约3秒) */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* USB已就绪, 以下printf均可见 */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\n\n========== WiFi_USB_SD Starting ==========\n");
+    printf("Chip: ESP32-S3 | SD: SDMMC 1-bit(CLK=36,CMD=35,D0=37)\n\n");
+
+    /* ---- SD卡初始化 ---- */
+    printf("[MAIN] Step 1/3: SD card init...\n");
+    sdmmc_card_t *sd_card = NULL;
+    esp_err_t sd_ret = sd_card_init(&sd_card);
+
+    if (sd_ret == ESP_OK && sd_card != NULL)
+    {
+        printf("[MAIN] Step 2/3: USB MSC init...\n");
+        ESP_ERROR_CHECK(usb_msc_init(sd_card));
+        usb_msc_mount("/sd");
+        printf("[MAIN] USB MSC ready! Plug USB OTG cable to PC.\n");
+    }
+    else
+    {
+        printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret);
+    }
+
+    /* ---- WiFi AP 初始化 ---- */
+    printf("[MAIN] Step 3/3: WiFi AP init...\n");
     wifi_init_softap();
+    printf("[MAIN] WiFi AP: SSID='123' PASS='123456789'\n");
+
+    /* ---- 主循环 ---- */
+    bool sd_ok = (sd_ret == ESP_OK);
+    int loop_count = 0;
+    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow(SD_OK)" : "fast(no_SD)");
+    LED(1);  /* 熄灭LED, 进入闪烁模式 */
 
     while (1)
     {
         LED_TOGGLE();
-        vTaskDelay(500);
+
+        if (++loop_count >= 25)
+        {
+            loop_count = 0;
+            printf("[LOOP] LED=%s SD=%s(%d)\n",
+                   sd_ok ? "slow" : "fast",
+                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret);
+        }
+
+        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));
     }
 }

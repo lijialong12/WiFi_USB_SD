@@ -83,5 +83,7 @@ D:/Fork/WiFi_USB_SD/build/esp-idf/spiffs/libspiffs.a
 D:/Fork/WiFi_USB_SD/build/esp-idf/touch_element/libtouch_element.a
 D:/Fork/WiFi_USB_SD/build/esp-idf/usb/libusb.a
 D:/Fork/WiFi_USB_SD/build/esp-idf/wifi_provisioning/libwifi_provisioning.a
+D:/Fork/WiFi_USB_SD/build/esp-idf/espressif__tinyusb/libespressif__tinyusb.a
+D:/Fork/WiFi_USB_SD/build/esp-idf/espressif__esp_tinyusb/libespressif__esp_tinyusb.a
 D:/Fork/WiFi_USB_SD/build/esp-idf/main/libmain.a
 D:/Fork/WiFi_USB_SD/build/esp-idf/BSP/libBSP.a
