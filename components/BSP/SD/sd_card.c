@@ -24,7 +24,13 @@
 #include "sd_card.h"                        /* SD卡驱动头文件: 引脚宏定义 + 函数声明 */
 #include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
 #include "driver/sdmmc_host.h"              /* ESP-IDF SDMMC主机驱动: sdmmc_host_t/sdmmc_card_t/sdmmc_card_init */
+#include "esp_vfs_fat.h"                    /* ESP-IDF FATFS VFS: esp_vfs_fat_register */
+#include "diskio_sdmmc.h"                   /* FATFS SDMMC diskio: ff_diskio_register_sdmmc */
+#include "diskio_impl.h"                    /* FATFS diskio: ff_diskio_get_drive, ff_diskio_unregister */
+#include "ff.h"                             /* FATFS: f_mount, FATFS, FRESULT */
 #include <stdio.h>                          /* 标准I/O: printf */
+#include <string.h>                         /* 字符串操作: strcmp */
+#include <dirent.h>                         /* POSIX目录: opendir, readdir, closedir */
 
 static const char *TAG = "SD_CARD";         /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 
@@ -172,4 +178,76 @@ esp_err_t sd_card_deinit(sdmmc_card_t *card)
     }
     printf("[SD] Deinit done\n");                                       /* 反初始化完成 */
     return ESP_OK;                                                      /* 返回成功 */
+}
+
+/**
+ * @brief       直接挂载FATFS到SD卡 (不经过USB MSC)
+ *              绕过TinyUSB, 直接通过ESP-IDF VFS挂载FATFS文件系统。
+ *              适用于只需本地/WiFi访问SD卡、不需要USB大容量存储的场景。
+ *              步骤: ①注册SDMMC为FATFS磁盘驱动 → ②注册VFS路径 →
+ *                    ③挂载FATFS → ④返回FATFS句柄
+ * @param       card: 已初始化的SD卡控制块(由sd_card_init返回)
+ * @param       base_path: 挂载点路径, 如"/sd"
+ * @param       max_files: FATFS同时打开文件数上限(建议5)
+ * @retval      ESP_OK: 挂载成功, 可通过base_path访问文件
+ * @retval      其他: 挂载失败
+ */
+esp_err_t sd_card_mount_fatfs(sdmmc_card_t *card, const char *base_path, int max_files)
+{
+    if (card == NULL || base_path == NULL) {
+        printf("[SD] FATFS mount: invalid args\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    printf("[SD] Mounting FATFS directly at %s (max_files=%d)...\n", base_path, max_files);
+
+    /* ---- 步骤1: 获取空闲物理驱动器号 ---- */
+    BYTE pdrv = 0xFF;
+    esp_err_t ret = ff_diskio_get_drive(&pdrv);
+    if (ret != ESP_OK) {
+        printf("[SD] FATFS mount: get_drive FAILED %s\n", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* ---- 步骤2: 注册SDMMC卡为FATFS磁盘I/O驱动 ---- */
+    ff_diskio_register_sdmmc(pdrv, card);
+
+    /* ---- 步骤3: 注册VFS路径 (让标准C API如fopen可访问) ---- */
+    char drv[3] = {(char)('0' + pdrv), ':', 0};
+    FATFS *fs = NULL;
+    ret = esp_vfs_fat_register(base_path, drv, max_files, &fs);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        printf("[SD] FATFS mount: already registered at %s (OK)\n", base_path);
+    } else if (ret != ESP_OK) {
+        printf("[SD] FATFS mount: vfs_register FAILED %s\n", esp_err_to_name(ret));
+        ff_diskio_unregister(pdrv);
+        return ret;
+    }
+
+    /* ---- 步骤4: 挂载FATFS ---- */
+    FRESULT fresult = f_mount(fs, drv, 1);
+    if (fresult != FR_OK) {
+        printf("[SD] FATFS mount: f_mount FAILED (FR=%d)\n", (int)fresult);
+        esp_vfs_fat_unregister_path(base_path);
+        ff_diskio_unregister(pdrv);
+        return ESP_FAIL;
+    }
+
+    printf("[SD] FATFS mounted at %s (pdrv=%d)\n", base_path, (int)pdrv);
+
+    /* 验证挂载: 列出根目录 */
+    DIR *test = opendir(base_path);
+    if (test != NULL) {
+        int cnt = 0;
+        struct dirent *d;
+        while ((d = readdir(test)) != NULL) {
+            if (strcmp(d->d_name, ".") != 0 && strcmp(d->d_name, "..") != 0) cnt++;
+        }
+        closedir(test);
+        printf("[SD] FATFS verify OK: %d entries at %s\n", cnt, base_path);
+    } else {
+        printf("[SD] WARNING: opendir(%s) failed after mount\n", base_path);
+    }
+
+    return ESP_OK;
 }

@@ -2,11 +2,12 @@
  ****************************************************************************************************
  * @file        main.c
  * @author      ONE
- * @version     V1.0
+ * @version     V1.1
  * @date        2026-06-11
- * @brief       主程序入口 - USB MSC(大容量存储) + WiFi AP 综合应用
+ * @brief       主程序入口 - USB MSC + WiFi AP + Web文件服务器 综合应用
  *              功能: ①初始化SD卡(SDMMC 4-bit模式) → ②注册USB MSC设备 →
- *                    ③启动WiFi AP热点 → ④主循环LED状态指示
+ *                    ③启动WiFi AP热点 → ④启动Web文件服务器(端口80) →
+ *                    ⑤主循环LED状态指示
  * @license     重庆博士康科技有限公司版权所有
  ****************************************************************************************************
  * @attention
@@ -22,6 +23,11 @@
  ****************************************************************************************************
  */
 
+/* ======================== 模式开关 ======================== */
+/* 设为1启用USB MSC(大容量存储), 但仅当板子有独立OTG USB口时可用    */
+/* 设为0禁用USB MSC, 直接挂载FATFS, 仅通过WiFi Web访问SD卡         */
+#define USE_USB_MSC  1   /* 1=USB+WiFi双模式(弹出U盘即切到WiFi) */
+
 /* ======================== 头文件包含 ======================== */
 #include <stdio.h>                          /* 标准I/O: printf, setvbuf */
 #include <stdlib.h>                         /* 标准库: malloc, free (间接使用) */
@@ -35,8 +41,11 @@
 #include "esp_wifi.h"                       /* ESP32 WiFi驱动: AP/STA模式 */
 #include "esp_event.h"                      /* ESP-IDF事件循环: WiFi事件处理 */
 #include "led.h"                            /* BSP-LED驱动: LED初始化/控制宏 */
-#include "sd_card.h"                        /* BSP-SD卡驱动: SDMMC初始化/反初始化 */
+#include "sd_card.h"                        /* BSP-SD卡驱动: SDMMC初始化/FATFS挂载 */
+#if USE_USB_MSC
 #include "usb_msc.h"                        /* BSP-USB MSC驱动: USB大容量存储设备 */
+#endif
+#include "web_server.h"                     /* Web文件服务器: HTTP文件管理API */
 
 
 /* ======================== WiFi AP 配置 ======================== */
@@ -48,31 +57,32 @@ static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_
 #define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"                      /* MAC地址格式化字符串 */
 
 
+/* ======================== USB/WiFi 状态 ======================== */
+static int g_sta_count = 0;                 /* 当前连接的WiFi客户端数量 */
+
 /**
  * @brief       WiFi事件处理回调函数
- *              处理STA(客户端)连接/断开事件, 打印客户端MAC地址和AID
- * @param       arg: 用户自定义参数(本处未使用, 注册时传NULL)
- * @param       event_base: 事件基类(WIFI_EVENT / IP_EVENT 等)
- * @param       event_id: 具体事件ID(如WIFI_EVENT_AP_STACONNECTED)
- * @param       event_data: 事件携带的数据(如wifi_event_ap_staconnected_t结构体指针)
- * @retval      无
+ *              USB/WiFi切换由TinyUSB自动处理:
+ *                PC连接USB → tud_mount_cb() → SD卡给PC (U盘模式)
+ *                PC弹出U盘 → tud_umount_cb() → SD卡还给ESP32 (WiFi模式)
+ *              用户无需手动切换, 弹出即切到WiFi, 重新插拔即切回USB
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    /* ---------- 事件: 有STA客户端连接到AP ---------- */
-    if (event_id == WIFI_EVENT_AP_STACONNECTED)                         /* 判断事件类型: 客户端连接 */
+    if (event_id == WIFI_EVENT_AP_STACONNECTED)
     {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data; /* 提取连接事件数据结构(含MAC/AID) */
-        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d",               /* 打印日志: 客户端MAC地址和关联ID */
-                 MAC2STR(event->mac), event->aid);                      /* MAC2STR展开6字节MAC, event->aid是关联标识符 */
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        g_sta_count++;
+        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d (total:%d)",
+                 MAC2STR(event->mac), event->aid, g_sta_count);
     }
-    /* ---------- 事件: 有STA客户端从AP断开 ---------- */
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)                 /* 判断事件类型: 客户端断开 */
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data; /* 提取断开事件数据结构 */
-        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d",              /* 打印日志: 断开客户端的MAC和AID */
-                 MAC2STR(event->mac), event->aid);                      /* MAC2STR展开MAC地址字节 */
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+        if (g_sta_count > 0) g_sta_count--;
+        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d (total:%d)",
+                 MAC2STR(event->mac), event->aid, g_sta_count);
     }
 }
 
@@ -138,7 +148,8 @@ static void wifi_init_softap(void)
 /**
  * @brief       应用程序主入口(app_main)
  *              ESP-IDF自动调用, 等价于C标准main()函数
- *              初始化顺序: NVS → LED → 等待USB枚举 → SD卡 → USB MSC → WiFi AP → 主循环
+ *              初始化顺序: NVS → LED → 等待USB枚举 → SD卡 → USB MSC →
+ *                          WiFi AP → Web服务器 → 主循环
  * @param       无
  * @retval      无(FreeRTOS任务中永不返回)
  */
@@ -160,7 +171,7 @@ void app_main(void)
     LED(1);                                                             /* 点亮LED(高电平), 表示系统已上电启动 */
 
     /* ===== 阶段0.7: 等待USB Serial/JTAG枚举完成 ===== */
-    vTaskDelay(pdMS_TO_TICKS(3000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
+    vTaskDelay(pdMS_TO_TICKS(6000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
 
     /* ===== 阶段0.8: 重定向标准输出 ===== */
     setvbuf(stdout, NULL, _IONBF, 0);                                   /* 设置stdout为无缓冲模式(printf立即输出, 不掉数据) */
@@ -174,18 +185,26 @@ void app_main(void)
     sdmmc_card_t *sd_card = NULL;                                       /* 定义SD卡控制块指针(初始为空) */
     esp_err_t sd_ret = sd_card_init(&sd_card);                          /* 调用BSP驱动初始化SD卡, 获取操作结果和卡控制块 */
 
-    if (sd_ret == ESP_OK && sd_card != NULL)                            /* 判断SD卡是否初始化成功(返回值OK且指针有效) */
+    if (sd_ret == ESP_OK && sd_card != NULL)
     {
-        /* SD卡就绪 → 初始化USB MSC大容量存储设备 */
-        printf("[MAIN] Step 2/3: USB MSC init...\n");                   /* 输出进度: 第2步USB MSC初始化 */
-        ESP_ERROR_CHECK(usb_msc_init(sd_card));                         /* 注册SD卡为USB大容量存储设备(TinyUSB MSC) */
-        ESP_ERROR_CHECK(usb_msc_mount("/sd"));                          /* 挂载SD卡文件系统到"/sd"路径(ESP32本地可读写) */
-        printf("[MAIN] USB MSC ready! Plug USB OTG cable to PC.\n");   /* 提示: 用USB OTG线连接电脑即可识别为U盘 */
+#if USE_USB_MSC
+        printf("[MAIN] Step 2/3: USB MSC init + FATFS mount...\n");
+        ESP_ERROR_CHECK(usb_msc_init(sd_card));
+        ESP_ERROR_CHECK(usb_msc_mount("/sd"));
+        printf("[MAIN] USB MSC ready. PC→U盘 | 弹出U盘→WiFi访问\n");
+#else
+        printf("[MAIN] Step 2/3: FATFS mount (direct)...\n");
+        esp_err_t mnt_ret = sd_card_mount_fatfs(sd_card, "/sd", 5);
+        if (mnt_ret != ESP_OK) {
+            printf("[MAIN] FATFS mount FAILED: %s\n", esp_err_to_name(mnt_ret));
+            sd_ret = mnt_ret;
+        }
+#endif
     }
-    else                                                                /* SD卡初始化失败 */
+    else
     {
-        printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret); /* 输出失败原因(错误名和错误码) */
-        printf("[MAIN] USB MSC will NOT be available (no SD card)\n");  /* 提示: 因无SD卡, USB MSC功能不可用 */
+        printf("[MAIN] SD card FAILED: %s (code %d)\n", esp_err_to_name(sd_ret), sd_ret);
+        printf("[MAIN] File access will NOT be available\n");
     }
 
     /* ===== 阶段2: WiFi AP 初始化 ===== */
@@ -193,24 +212,35 @@ void app_main(void)
     wifi_init_softap();                                                 /* 启动WiFi SoftAP: SSID='BOSSCOM_USB_AP' */
     printf("[MAIN] WiFi AP: SSID='BOSSCOM_USB_AP' PASS='012345678'\n"); /* 输出WiFi AP的SSID和密码供用户连接 */
 
-    /* ===== 阶段3: 主循环(LED状态指示 + 周期日志) ===== */
-    bool sd_ok = (sd_ret == ESP_OK);                                    /* 缓存SD卡状态: true=正常, false=失败 */
-    int loop_count = 0;                                                 /* 循环计数器(用于控制日志输出频率) */
-    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow(SD_OK)" : "fast(no_SD)"); /* 输出LED闪烁模式说明 */
-    LED(0);                                                             /* 熄灭LED, 进入主循环闪烁模式 */
-
-    while (1)                                                           /* 无限主循环(FreeRTOS任务永不退出) */
+    /* ===== 阶段2.5: Web文件服务器启动 (端口80, http://192.168.4.1) ===== */
     {
-        LED_TOGGLE();                                                   /* 翻转LED电平(亮→灭 或 灭→亮) */
+        printf("[MAIN] Step 2.5/3: Web server start...\n");
+        esp_err_t ws_ret = web_server_start();
+        if (ws_ret == ESP_OK) {
+            printf("[MAIN] Web server ready: http://192.168.4.1\n");
+        } else {
+            printf("[MAIN] Web server FAILED: %s\n", esp_err_to_name(ws_ret));
+        }
+    }
 
-        if (++loop_count >= 25)                                         /* 每25次循环(约5秒或2.5秒)打印一次日志 */
-        {
-            loop_count = 0;                                             /* 重置循环计数器 */
-            printf("[LOOP] LED=%s SD=%s(%d)\n",                         /* 输出当前状态: LED闪烁速度 + SD卡状态 */
-                   sd_ok ? "slow" : "fast",                             /* SD正常时200ms周期→慢闪; 失败时100ms周期→快闪 */
-                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret);    /* 输出SD卡状态(OK或错误名和错误码) */
+    /* ===== 阶段3: 主循环(LED状态指示 + 周期日志) ===== */
+    bool sd_ok = (sd_ret == ESP_OK);
+    int loop_count = 0;
+    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow" : "fast");
+    LED(0);
+
+    while (1)
+    {
+        LED_TOGGLE();
+
+        if (++loop_count >= 25) {
+            loop_count = 0;
+            printf("[LOOP] LED=%s SD=%s(%d) STA=%d\n",
+                   sd_ok ? "slow" : "fast",
+                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret,
+                   g_sta_count);
         }
 
-        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));   /* 延时: SD正常=200ms → 慢闪; SD失败=100ms → 快闪告警 */
+        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));
     }
 }
