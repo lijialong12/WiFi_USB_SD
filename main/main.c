@@ -44,6 +44,8 @@
 #include "sd_card.h"                        /* BSP-SD卡驱动: SDMMC初始化/FATFS挂载 */
 #if USE_USB_MSC
 #include "usb_msc.h"                        /* BSP-USB MSC驱动: USB大容量存储设备 */
+#include "tusb.h"                           /* TinyUSB: tud_connect/disconnect */
+#include "tusb_msc_storage.h"               /* TinyUSB MSC: mount/unmount状态 */
 #endif
 #include "web_server.h"                     /* Web文件服务器: HTTP文件管理API */
 
@@ -57,32 +59,64 @@ static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_
 #define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"                      /* MAC地址格式化字符串 */
 
 
-/* ======================== USB/WiFi 状态 ======================== */
-static int g_sta_count = 0;                 /* 当前连接的WiFi客户端数量 */
+/* ======================== USB/WiFi 动态切换 ======================== */
+static int  g_sta_count       = 0;      /* 当前WiFi客户端数 */
+static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
+static int  g_stable_cnt      = 0;       /* 防抖计数器 */
+#define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
+#define DEBOUNCE_USB   50                /* 断WiFi后等10秒切回U盘模式 (50×200ms) */
 
 /**
- * @brief       WiFi事件处理回调函数
- *              USB/WiFi切换由TinyUSB自动处理:
- *                PC连接USB → tud_mount_cb() → SD卡给PC (U盘模式)
- *                PC弹出U盘 → tud_umount_cb() → SD卡还给ESP32 (WiFi模式)
- *              用户无需手动切换, 弹出即切到WiFi, 重新插拔即切回USB
+ * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
+ */
+static void switch_to_wifi_mode(void)
+{
+#if USE_USB_MSC
+    printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
+    tud_disconnect();                               /* PC看到U盘移除 */
+    vTaskDelay(pdMS_TO_TICKS(800));                 /* 等PC处理断开 */
+    esp_err_t ret = tinyusb_msc_storage_mount("/sd");
+    if (ret == ESP_OK) {
+        g_wifi_mode = true;
+        printf("[MODE] WiFi mode OK - web server can access SD\n");
+    } else {
+        printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
+    }
+#endif
+}
+
+/**
+ * @brief       切换到USB U盘模式: 卸载本地FATFS, 连接USB MSC
+ */
+static void switch_to_usb_mode(void)
+{
+#if USE_USB_MSC
+    printf("[MODE] → USB mode (local unmount + USB connect)\n");
+    tinyusb_msc_storage_unmount();
+    g_wifi_mode = false;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    tud_connect();                                  /* PC看到U盘插入 */
+    printf("[MODE] USB mode OK - PC can access SD as USB drive\n");
+#endif
+}
+
+/**
+ * @brief       WiFi事件处理回调: 仅统计客户端数量, 切换在main循环中做防抖
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    if (event_id == WIFI_EVENT_AP_STACONNECTED)
-    {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
         g_sta_count++;
         ESP_LOGI(TAG, "station " MACSTR " join, AID=%d (total:%d)",
-                 MAC2STR(event->mac), event->aid, g_sta_count);
+                 MAC2STR(e->mac), e->aid, g_sta_count);
     }
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
-    {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)event_data;
         if (g_sta_count > 0) g_sta_count--;
         ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d (total:%d)",
-                 MAC2STR(event->mac), event->aid, g_sta_count);
+                 MAC2STR(e->mac), e->aid, g_sta_count);
     }
 }
 
@@ -223,22 +257,54 @@ void app_main(void)
         }
     }
 
-    /* ===== 阶段3: 主循环(LED状态指示 + 周期日志) ===== */
+    /* ===== 阶段3: 主循环(LED + 模式切换防抖 + 周期日志) ===== */
     bool sd_ok = (sd_ret == ESP_OK);
     int loop_count = 0;
-    printf("[MAIN] Loop start. LED %s\n\n", sd_ok ? "slow" : "fast");
+#if USE_USB_MSC
+    g_wifi_mode = false;  /* 初始: USB U盘模式 (PC可看到) */
+#endif
+    printf("[MAIN] Loop start. LED %s | USB+WiFi auto-switch\n\n", sd_ok ? "slow" : "fast");
     LED(0);
 
     while (1)
     {
         LED_TOGGLE();
 
+#if USE_USB_MSC
+        /* ---- 防抖切换逻辑 ---- */
+        if (sd_ok) {
+            if (g_sta_count > 0 && !g_wifi_mode) {
+                /* 有人连WiFi → 想切到网页模式 */
+                g_stable_cnt++;
+                if (g_stable_cnt >= DEBOUNCE_WIFI) {
+                    switch_to_wifi_mode();
+                    g_stable_cnt = 0;
+                }
+            } else if (g_sta_count == 0 && g_wifi_mode) {
+                /* 没人连WiFi → 想切回U盘模式 */
+                g_stable_cnt++;
+                if (g_stable_cnt >= DEBOUNCE_USB) {
+                    switch_to_usb_mode();
+                    g_stable_cnt = 0;
+                }
+            } else {
+                g_stable_cnt = 0;  /* 状态稳定, 重置计数器 */
+            }
+        }
+#endif
+
         if (++loop_count >= 25) {
             loop_count = 0;
-            printf("[LOOP] LED=%s SD=%s(%d) STA=%d\n",
+#if USE_USB_MSC
+            printf("[LOOP] LED=%s MODE=%s STA=%d\n",
                    sd_ok ? "slow" : "fast",
-                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret,
+                   g_wifi_mode ? "WiFi" : "USB",
                    g_sta_count);
+#else
+            printf("[LOOP] LED=%s SD=%s(%d)\n",
+                   sd_ok ? "slow" : "fast",
+                   sd_ok ? "OK" : esp_err_to_name(sd_ret), sd_ret);
+#endif
         }
 
         vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(100));
