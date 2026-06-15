@@ -29,6 +29,8 @@
 #include "freertos/FreeRTOS.h"               /* FreeRTOS: vTaskDelay */
 #include "freertos/task.h"                   /* FreeRTOS任务: vTaskDelay */
 #include "tusb_msc_storage.h"                /* TinyUSB MSC: tinyusb_msc_storage_mount */
+#include "nvs.h"                             /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
+#include "esp_system.h"                      /* ESP系统: esp_restart() */
 #include <stdio.h>                           /* 标准I/O: snprintf, fopen, fread, fclose */
 #include <stdlib.h>                          /* 标准库: malloc, free, realloc */
 #include <string.h>                          /* 字符串: strlen, strcpy, strchr, strcmp */
@@ -378,6 +380,7 @@ static esp_err_t api_list_handler(httpd_req_t *req)
     if (dir == NULL) {
         /* 可能是USB弹出后TinyUSB未自动重新挂载, 尝试手动挂载一次 */
         printf("[WEB_SRV] opendir failed, trying remount...\n");
+        tinyusb_msc_storage_unmount();                              /* 先卸载清理残留状态 */
         esp_err_t remount_ret = tinyusb_msc_storage_mount("/sd");
         printf("[WEB_SRV] remount result: %s\n", esp_err_to_name(remount_ret));
         if (remount_ret == ESP_OK) {
@@ -582,6 +585,7 @@ static esp_err_t api_file_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Missing 'path' parameter\",\"code\":\"MISSING_PATH\"}");
         return ESP_FAIL;
     }
+    
     /* 确保URL解码 */
     url_decode_inplace(raw_path);
     if (httpd_query_key_value(query, "action", action, sizeof(action)) != ESP_OK) {
@@ -768,6 +772,178 @@ static esp_err_t api_file_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ======================== WiFi配置API ======================== */
+
+/**
+ * @brief       将WiFi配置保存到NVS(非易失性存储)
+ * @param       ssid: WiFi名称 (最大31字符)
+ * @param       password: WiFi密码 (最大63字符, 可为空字符串表示开放网络)
+ * @retval      ESP_OK: 保存成功
+ */
+static esp_err_t save_wifi_config_to_nvs(const char *ssid, const char *password)
+{
+    nvs_handle_t nvs_h;
+    esp_err_t ret = nvs_open("wifi_config", NVS_READWRITE, &nvs_h);
+    if (ret != ESP_OK) {
+        printf("[WEB_SRV] NVS open for write failed: %s\n", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = nvs_set_str(nvs_h, "ssid", ssid);
+    if (ret != ESP_OK) {
+        printf("[WEB_SRV] NVS set ssid failed: %s\n", esp_err_to_name(ret));
+        nvs_close(nvs_h);
+        return ret;
+    }
+
+    ret = nvs_set_str(nvs_h, "password", password);
+    if (ret != ESP_OK) {
+        printf("[WEB_SRV] NVS set password failed: %s\n", esp_err_to_name(ret));
+        nvs_close(nvs_h);
+        return ret;
+    }
+
+    ret = nvs_commit(nvs_h);
+    if (ret != ESP_OK) {
+        printf("[WEB_SRV] NVS commit failed: %s\n", esp_err_to_name(ret));
+    }
+    nvs_close(nvs_h);
+    return ret;
+}
+
+/**
+ * @brief       读取当前WiFi配置: GET /api/wifi-config
+ *              密码脱敏返回(仅显示首尾字符)
+ */
+static esp_err_t wifi_config_get_handler(httpd_req_t *req)
+{
+    printf("[WEB_SRV] >>> HANDLER: GET /api/wifi-config\n");
+
+    char ssid[32] = "BOSSCOM_USB_AP";
+    char password[64] = "012345678";
+    nvs_handle_t nvs_h;
+
+    if (nvs_open("wifi_config", NVS_READONLY, &nvs_h) == ESP_OK) {
+        size_t len = sizeof(ssid);
+        nvs_get_str(nvs_h, "ssid", ssid, &len);
+        len = sizeof(password);
+        nvs_get_str(nvs_h, "password", password, &len);
+        nvs_close(nvs_h);
+    }
+
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"ok\":true,\"ssid\":\"%s\",\"password\":\"%s\"}",
+        ssid, password);
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+
+    printf("[WEB_SRV] <<< DONE: GET /api/wifi-config → SSID='%s'\n", ssid);
+    return ESP_OK;
+}
+
+/**
+ * @brief       保存WiFi配置: POST /api/wifi-config
+ *              Body: {"ssid":"...", "password":"..."}
+ *              保存后延时1秒自动重启芯片使配置生效
+ */
+static esp_err_t wifi_config_post_handler(httpd_req_t *req)
+{
+    printf("[WEB_SRV] >>> HANDLER: POST /api/wifi-config\n");
+
+    /* ---- 读取POST body ---- */
+    char body[256] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Empty request body\",\"code\":\"EMPTY_BODY\"}");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+    printf("[WEB_SRV] POST body: '%s'\n", body);
+
+    /* ---- 简易JSON解析: 提取ssid和password字段 ---- */
+    char new_ssid[32] = {0};
+    char new_pass[64] = {0};
+
+    /* 查找 "ssid" 字段 */
+    const char *ssid_key = strstr(body, "\"ssid\"");
+    if (ssid_key) {
+        const char *val_start = strchr(ssid_key, ':');
+        if (val_start) {
+            val_start++; /* 跳过冒号 */
+            while (*val_start == ' ' || *val_start == '"') val_start++; /* 跳过空格和引号 */
+            const char *val_end = strchr(val_start, '"');
+            if (val_end) {
+                size_t len = val_end - val_start;
+                if (len >= sizeof(new_ssid)) len = sizeof(new_ssid) - 1;
+                memcpy(new_ssid, val_start, len);
+                new_ssid[len] = '\0';
+            }
+        }
+    }
+
+    /* 查找 "password" 字段 */
+    const char *pass_key = strstr(body, "\"password\"");
+    if (pass_key) {
+        const char *val_start = strchr(pass_key, ':');
+        if (val_start) {
+            val_start++;
+            while (*val_start == ' ' || *val_start == '"') val_start++;
+            const char *val_end = strchr(val_start, '"');
+            if (val_end) {
+                size_t len = val_end - val_start;
+                if (len >= sizeof(new_pass)) len = sizeof(new_pass) - 1;
+                memcpy(new_pass, val_start, len);
+                new_pass[len] = '\0';
+            }
+        }
+    }
+
+    /* ---- 校验 ---- */
+    size_t ssid_len = strlen(new_ssid);
+    size_t pass_len = strlen(new_pass);
+
+    if (ssid_len < 1 || ssid_len > 31) {
+        printf("[WEB_SRV] SSID validation failed: len=%d\n", (int)ssid_len);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SSID\xE9\x95\xBF\xE5\xBA\xA6\xE5\xBF\x85\xE9\xA1\xBB\xE4\xB8\xBA""1-31\xE4\xBD\x8D\",\"code\":\"INVALID_SSID\"}");
+        return ESP_FAIL;
+    }
+
+    if (pass_len > 0 && (pass_len < 8 || pass_len > 63)) {
+        printf("[WEB_SRV] Password validation failed: len=%d\n", (int)pass_len);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"\xE5\xAF\x86\xE7\xA0\x81\xE9\x9C\x80\xE8\xA6\x81""8-63\xE4\xBD\x8D\xE6\x88\x96\xE7\x95\x99\xE7\xA9\xBA\",\"code\":\"INVALID_PASSWORD\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 保存到NVS ---- */
+    esp_err_t ret = save_wifi_config_to_nvs(new_ssid, (pass_len > 0) ? new_pass : "");
+    if (ret != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"\xE4\xBF\x9D\xE5\xAD\x98\xE5\xA4\xB1\xE8\xB4\xA5\",\"code\":\"SAVE_FAILED\"}");
+        return ESP_FAIL;
+    }
+
+    printf("[WEB_SRV] WiFi config saved: SSID='%s', PW_LEN=%d, restarting...\n", new_ssid, (int)pass_len);
+
+    /* ---- 返回成功响应 ---- */
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"\xE5\xB7\xB2\xE4\xBF\x9D\xE5\xAD\x98\xEF\xBC\x8CWiFi\xE6\xAD\xA3\xE5\x9C\xA8\xE9\x87\x8D\xE5\x90\xAF\xEF\xBC\x8C\xE8\xAF\xB7\xE9\x87\x8D\xE6\x96\xB0\xE8\xBF\x9E\xE6\x8E\xA5\"}");
+
+    /* ---- 延时1秒后重启 ---- */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+
+    return ESP_OK;
+}
+
 /* ======================== 公开API ======================== */
 
 /**
@@ -810,7 +986,7 @@ esp_err_t web_server_start(void)
 
     /* ---- 创建HTTP服务器配置 ---- */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;                                /* 足够3个处理器 */
+    config.max_uri_handlers = 10;                                /* 当前6个处理器(含2个wifi-config) */
     config.stack_size = 8192;                                   /* 8KB栈: 足够文件I/O操作 */
     config.server_port = 80;                                    /* 标准HTTP端口 */
 
@@ -886,6 +1062,38 @@ esp_err_t web_server_start(void)
         return ret;
     }
     printf("[WEB_SRV] Registered: GET /api/file\n");
+
+    /* ---- 注册URI处理器: GET /api/wifi-config (读取WiFi配置) ---- */
+    httpd_uri_t uri_wifi_get = {
+        .uri       = "/api/wifi-config",
+        .method    = HTTP_GET,
+        .handler   = wifi_config_get_handler,
+        .user_ctx  = NULL
+    };
+    ret = httpd_register_uri_handler(g_server, &uri_wifi_get);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register GET /api/wifi-config handler");
+        httpd_stop(g_server);
+        g_server = NULL;
+        return ret;
+    }
+    printf("[WEB_SRV] Registered: GET /api/wifi-config\n");
+
+    /* ---- 注册URI处理器: POST /api/wifi-config (保存WiFi配置) ---- */
+    httpd_uri_t uri_wifi_post = {
+        .uri       = "/api/wifi-config",
+        .method    = HTTP_POST,
+        .handler   = wifi_config_post_handler,
+        .user_ctx  = NULL
+    };
+    ret = httpd_register_uri_handler(g_server, &uri_wifi_post);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register POST /api/wifi-config handler");
+        httpd_stop(g_server);
+        g_server = NULL;
+        return ret;
+    }
+    printf("[WEB_SRV] Registered: POST /api/wifi-config\n");
 
     printf("[WEB_SRV] Web file server ready at http://192.168.4.1\n");
     ESP_LOGI(TAG, "Web file server started successfully");

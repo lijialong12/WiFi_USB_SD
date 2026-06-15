@@ -25,6 +25,7 @@
 
 #include "usb_msc.h"                        /* USB MSC驱动头文件: 函数声明 */
 #include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
+#include "class/msc/msc.h"                  /* TinyUSB MSC类常量: MSC_SUBCLASS_SCSI/MSC_PROTOCOL_BOT(必须在tinyusb.h之前,否则TUD_MSC_DESCRIPTOR宏展开失败) */
 #include "tinyusb.h"                        /* TinyUSB驱动核心: tinyusb_config_t, tinyusb_driver_install() */
 #include "tusb_msc_storage.h"               /* TinyUSB MSC存储抽象层: tinyusb_msc_storage_init_sdmmc/mount/unmount */
 

@@ -38,6 +38,7 @@
 #include "esp_system.h"                     /* ESP32系统API: 芯片信息 */
 #include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
 #include "nvs_flash.h"                      /* NVS(非易失性存储) Flash: WiFi配置存储 */
+#include "nvs.h"                            /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
 #include "esp_wifi.h"                       /* ESP32 WiFi驱动: AP/STA模式 */
 #include "esp_event.h"                      /* ESP-IDF事件循环: WiFi事件处理 */
 #include "led.h"                            /* BSP-LED驱动: LED初始化/控制宏 */
@@ -64,7 +65,7 @@ static int  g_sta_count       = 0;      /* 当前WiFi客户端数 */
 static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
 static int  g_stable_cnt      = 0;       /* 防抖计数器 */
 #define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
-#define DEBOUNCE_USB   50                /* 断WiFi后等10秒切回U盘模式 (50×200ms) */
+#define DEBOUNCE_USB   20                /* 断WiFi后等10秒切回U盘模式 (20×200ms) */
 
 /**
  * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
@@ -75,6 +76,8 @@ static void switch_to_wifi_mode(void)
     printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
     tud_disconnect();                               /* PC看到U盘移除 */
     vTaskDelay(pdMS_TO_TICKS(800));                 /* 等PC处理断开 */
+    /* 先卸载再挂载, 确保VFS/FATFS状态干净 (TinyUSB MSC层可能已部分卸载但is_fat_mounted仍为true) */
+    tinyusb_msc_storage_unmount();
     esp_err_t ret = tinyusb_msc_storage_mount("/sd");
     if (ret == ESP_OK) {
         g_wifi_mode = true;
@@ -147,19 +150,45 @@ static void wifi_init_softap(void)
     /* 步骤5: 注册WiFi事件处理回调(监听所有WiFi事件) */
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL)); /* 注册回调: 匹配所有WIFI_EVENT */
 
+    /* ===== 从NVS读取WiFi配置(已保存的用户设置), 读不到则用默认值 ===== */
+    char nvs_ssid[32] = {0};                                             /* NVS读取的SSID缓冲区(max 31 + null) */
+    char nvs_pass[64] = {0};                                             /* NVS读取的密码缓冲区(max 63 + null) */
+    nvs_handle_t nvs_h;
+    if (nvs_open("wifi_config", NVS_READONLY, &nvs_h) == ESP_OK) {
+        size_t len;
+        /* 读取SSID */
+        len = sizeof(nvs_ssid);
+        if (nvs_get_str(nvs_h, "ssid", nvs_ssid, &len) != ESP_OK) {
+            strcpy(nvs_ssid, EXAMPLE_ESP_WIFI_SSID);                    /* NVS无数据: 用默认值 */
+        }
+        /* 读取密码 */
+        len = sizeof(nvs_pass);
+        if (nvs_get_str(nvs_h, "password", nvs_pass, &len) != ESP_OK) {
+            strcpy(nvs_pass, EXAMPLE_ESP_WIFI_PASS);                    /* NVS无数据: 用默认值 */
+        }
+        nvs_close(nvs_h);
+        printf("[AP] NVS config loaded: SSID='%s'\n", nvs_ssid);
+    } else {
+        /* NVS namespace不存在(首次开机): 使用默认值 */
+        strcpy(nvs_ssid, EXAMPLE_ESP_WIFI_SSID);
+        strcpy(nvs_pass, EXAMPLE_ESP_WIFI_PASS);
+        printf("[AP] NVS not found, using defaults: SSID='%s'\n", nvs_ssid);
+    }
+
     /* 步骤6: 配置AP参数(SSID、密码、加密方式、最大连接数) */
     wifi_config_t wifi_config = {                                       /* 定义WiFi配置结构体(使用C99指定初始化器) */
         .ap = {                                                         /* AP模式专用配置字段 */
-            .ssid = EXAMPLE_ESP_WIFI_SSID,                              /* 设置WiFi热点名称 */
-            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),                  /* 设置SSID字符串长度 */
-            .password = EXAMPLE_ESP_WIFI_PASS,                          /* 设置WiFi密码 */
+            .ssid_len = strlen(nvs_ssid),                               /* 设置SSID字符串长度 */
             .max_connection = EXAMPLE_MAX_STA_CONN,                     /* 设置最大同时连接数(硬件限制通常为4~10) */
             .authmode = WIFI_AUTH_WPA_WPA2_PSK                         /* 设置加密认证模式: WPA/WPA2-PSK混合 */
         },
     };
+    /* 将NVS读取的SSID和密码复制到wifi_config结构体 */
+    memcpy(wifi_config.ap.ssid, nvs_ssid, sizeof(wifi_config.ap.ssid));
+    memcpy(wifi_config.ap.password, nvs_pass, sizeof(wifi_config.ap.password));
 
     /* 步骤7: 如果密码为空, 则设置为开放网络(无加密) */
-    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0)                             /* 判断密码长度是否为0 */
+    if (strlen(nvs_pass) == 0)                                          /* 判断密码长度是否为0 */
     {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;                       /* 设为开放模式(Open), 不需要密码即可连接 */
     }
@@ -176,7 +205,7 @@ static void wifi_init_softap(void)
     ESP_LOGI(TAG, "Set up softAP with IP: " IPSTR, IP2STR(&ip_info.ip)); /* 打印AP的IPv4地址(默认192.168.4.1) */
 
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:'%s' password:'%s'", /* 打印WiFi AP配置完成信息 */
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);             /* 输出SSID和密码供调试确认 */
+             nvs_ssid, nvs_pass);                                         /* 输出实际使用的SSID和密码供调试确认 */
 }
 
 /**
