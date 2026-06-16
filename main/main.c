@@ -78,7 +78,7 @@ static void switch_to_wifi_mode(void)
     vTaskDelay(pdMS_TO_TICKS(800));                 /* 等PC处理断开 */
     /* 先卸载再挂载, 确保VFS/FATFS状态干净 (TinyUSB MSC层可能已部分卸载但is_fat_mounted仍为true) */
     tinyusb_msc_storage_unmount();
-    esp_err_t ret = tinyusb_msc_storage_mount("/sd");
+    esp_err_t ret = tinyusb_msc_storage_mount("/SD");
     if (ret == ESP_OK) {
         g_wifi_mode = true;
         printf("[MODE] WiFi mode OK - web server can access SD\n");
@@ -143,6 +143,19 @@ static void wifi_init_softap(void)
     /* 步骤3: 使用默认配置创建WiFi AP网络接口 */
     esp_netif_create_default_wifi_ap();                                 /* 创建并注册默认的WiFi AP netif实例(WIFI_AP_DEF) */
 
+    /* 步骤3.5: 设置自定义AP的IP地址 (默认是192.168.4.1, 这里改成192.168.3.1) */
+    {
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");     /* 获取AP的netif句柄 */
+        esp_netif_ip_info_t ip_info = {
+            .ip      = {.addr = ESP_IP4TOADDR(192, 168, 3, 1)},   /* AP自身IP */
+            .gw      = {.addr = ESP_IP4TOADDR(192, 168, 3, 1)},   /* 网关(=AP) */
+            .netmask = {.addr = ESP_IP4TOADDR(255, 255, 255, 0)}, /* 子网掩码 */
+        };
+        esp_netif_dhcps_stop(ap_netif);                                      /* 先停止DHCP服务器(改IP前必须) */
+        esp_netif_set_ip_info(ap_netif, &ip_info);                           /* 设置新的IP信息 */
+        esp_netif_dhcps_start(ap_netif);                                     /* 重新启动DHCP(客户端会分配到192.168.3.x) */
+    }
+
     /* 步骤4: 初始化WiFi驱动(分配资源、配置PHY) */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();                /* 获取WiFi初始化的默认配置(含操作系统相关参数) */
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));                               /* 用默认配置初始化WiFi硬件驱动层 */
@@ -202,7 +215,7 @@ static void wifi_init_softap(void)
     esp_netif_ip_info_t ip_info;                                        /* 定义IP信息结构体(含IP/网关/掩码) */
     esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip_info); /* 通过接口键名获取netif句柄, 再读取IP信息 */
 
-    ESP_LOGI(TAG, "Set up softAP with IP: " IPSTR, IP2STR(&ip_info.ip)); /* 打印AP的IPv4地址(默认192.168.4.1) */
+    ESP_LOGI(TAG, "Set up softAP with IP: " IPSTR, IP2STR(&ip_info.ip)); /* 打印AP的IPv4地址(已设为192.168.3.1) */
 
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:'%s' password:'%s'", /* 打印WiFi AP配置完成信息 */
              nvs_ssid, nvs_pass);                                         /* 输出实际使用的SSID和密码供调试确认 */
@@ -253,11 +266,11 @@ void app_main(void)
 #if USE_USB_MSC
         printf("[MAIN] Step 2/3: USB MSC init + FATFS mount...\n");
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
-        ESP_ERROR_CHECK(usb_msc_mount("/sd"));
+        ESP_ERROR_CHECK(usb_msc_mount("/SD"));
         printf("[MAIN] USB MSC ready. PC→U盘 | 弹出U盘→WiFi访问\n");
 #else
         printf("[MAIN] Step 2/3: FATFS mount (direct)...\n");
-        esp_err_t mnt_ret = sd_card_mount_fatfs(sd_card, "/sd", 5);
+        esp_err_t mnt_ret = sd_card_mount_fatfs(sd_card, "/SD", 5);
         if (mnt_ret != ESP_OK) {
             printf("[MAIN] FATFS mount FAILED: %s\n", esp_err_to_name(mnt_ret));
             sd_ret = mnt_ret;
@@ -275,12 +288,12 @@ void app_main(void)
     wifi_init_softap();                                                 /* 启动WiFi SoftAP: SSID='BOSSCOM_USB_AP' */
     printf("[MAIN] WiFi AP: SSID='BOSSCOM_USB_AP' PASS='012345678'\n"); /* 输出WiFi AP的SSID和密码供用户连接 */
 
-    /* ===== 阶段2.5: Web文件服务器启动 (端口80, http://192.168.4.1) ===== */
+    /* ===== 阶段2.5: Web文件服务器启动 (端口80, http://192.168.3.1) ===== */
     {
         printf("[MAIN] Step 2.5/3: Web server start...\n");
         esp_err_t ws_ret = web_server_start();
         if (ws_ret == ESP_OK) {
-            printf("[MAIN] Web server ready: http://192.168.4.1\n");
+            printf("[MAIN] Web server ready: http://192.168.3.1\n");
         } else {
             printf("[MAIN] Web server FAILED: %s\n", esp_err_to_name(ws_ret));
         }

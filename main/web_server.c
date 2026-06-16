@@ -43,7 +43,7 @@ static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP
 
 /* ======================== 全局变量 ======================== */
 static httpd_handle_t g_server = NULL;       /* HTTP服务器句柄: NULL=未启动, 非NULL=运行中 */
-static char g_base_path[16] = "/sd";         /* SD卡根路径: 所有文件访问均限制在此目录下 */
+static char g_base_path[16] = "/SD";         /* SD卡根路径: 所有文件访问均限制在此目录下 */
 
 /* ======================== MIME类型映射表 ======================== */
 /* 文件扩展名 → HTTP Content-Type 映射, 用于文件预览和下载 */
@@ -190,10 +190,10 @@ static bool validate_path(const char *path, char *normalized, size_t max_len)
     while (*path == ' ') path++;
     if (*path == '\0') return false;                            /* 空字符串 */
 
-    /* ---- 必须以 /sd 开头 ---- */
+    /* ---- 必须以 /SD 开头 ---- */
     size_t base_len = strlen(g_base_path);
     if (strncmp(path, g_base_path, base_len) != 0) return false;
-    /* 必须刚好匹配 /sd 或 /sd/xxx */
+    /* 必须刚好匹配 /SD 或 /SD/xxx */
     if (path[base_len] != '\0' && path[base_len] != '/') return false;
 
     /* ---- 规范化: 解析 . 和 .. 段 ---- */
@@ -207,13 +207,13 @@ static bool validate_path(const char *path, char *normalized, size_t max_len)
         *out++ = path[i];
         remaining--;
     }
-    /* 如果输入就是 /sd, 直接返回 */
+    /* 如果输入就是 /SD, 直接返回 */
     if (path[base_len] == '\0') {
         *out = '\0';
         return true;
     }
 
-    /* 跳过 /sd/ 后的分隔符, 逐段处理 */
+    /* 跳过 /SD/ 后的分隔符, 逐段处理 */
     in = path + base_len;
     if (*in == '/') in++;
 
@@ -242,7 +242,7 @@ static bool validate_path(const char *path, char *normalized, size_t max_len)
                 out--;                                         /* 移除 / */
                 remaining++;
             }
-            /* 不允许穿越到 /sd 之外 */
+            /* 不允许穿越到 /SD 之外 */
             if (out < normalized + (int)base_len) return false;
         }
         /* 普通路径段: 追加 */
@@ -258,7 +258,7 @@ static bool validate_path(const char *path, char *normalized, size_t max_len)
 
     *out = '\0';
 
-    /* 最终检查: 规范化后至少等于 /sd */
+    /* 最终检查: 规范化后至少等于 /SD */
     if (strncmp(normalized, g_base_path, base_len) != 0) return false;
     if (strlen(normalized) < base_len) return false;
 
@@ -381,7 +381,7 @@ static esp_err_t api_list_handler(httpd_req_t *req)
         /* 可能是USB弹出后TinyUSB未自动重新挂载, 尝试手动挂载一次 */
         printf("[WEB_SRV] opendir failed, trying remount...\n");
         tinyusb_msc_storage_unmount();                              /* 先卸载清理残留状态 */
-        esp_err_t remount_ret = tinyusb_msc_storage_mount("/sd");
+        esp_err_t remount_ret = tinyusb_msc_storage_mount("/SD");
         printf("[WEB_SRV] remount result: %s\n", esp_err_to_name(remount_ret));
         if (remount_ret == ESP_OK) {
             dir = opendir(norm_path);  /* 重试 */
@@ -964,9 +964,9 @@ esp_err_t web_server_start(void)
 
     /* ---- 启动前诊断: 检查SD卡是否可访问 ---- */
     {
-        DIR *test_dir = opendir("/sd");
+        DIR *test_dir = opendir("/SD");
         if (test_dir == NULL) {
-            printf("[WEB_SRV] WARNING: Cannot opendir('/sd') - SD card not accessible!\n");
+            printf("[WEB_SRV] WARNING: Cannot opendir('/SD') - SD card not accessible!\n");
             printf("[WEB_SRV] Possible reasons:\n");
             printf("[WEB_SRV]   1) No SD card inserted\n");
             printf("[WEB_SRV]   2) USB cable connected to OTG port (PC claimed the storage)\n");
@@ -980,7 +980,7 @@ esp_err_t web_server_start(void)
                 if (strcmp(d->d_name, ".") != 0 && strcmp(d->d_name, "..") != 0) count++;
             }
             closedir(test_dir);
-            printf("[WEB_SRV] SD card OK: /sd has %d entries\n", count);
+            printf("[WEB_SRV] SD card OK: /SD  has %d entries\n", count);
         }
     }
 
@@ -1095,7 +1095,7 @@ esp_err_t web_server_start(void)
     }
     printf("[WEB_SRV] Registered: POST /api/wifi-config\n");
 
-    printf("[WEB_SRV] Web file server ready at http://192.168.4.1\n");
+    printf("[WEB_SRV] Web file server ready at http://192.168.3.1\n");
     ESP_LOGI(TAG, "Web file server started successfully");
     return ESP_OK;
 }

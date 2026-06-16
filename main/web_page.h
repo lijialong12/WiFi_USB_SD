@@ -78,14 +78,14 @@ static const char INDEX_HTML[] =
     "</div>\n"
     "</div>\n"
     /* 文件列表区域 */
-    "<div class=\"bar\" id=\"bread\"><a onclick=\"ld('/sd')\">/sd</a></div>\n"
+    "<div class=\"bar\" id=\"bread\"><a onclick=\"ld('/SD')\">/SD</a></div>\n"
     "<div class=\"info\" id=\"info\">\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x8A\xA0\xE8\xBD\xBD...</div>\n"
     "<div id=\"content\"></div>\n"
     "<div style=\"margin-top:10px\"><button class=\"btn-refresh\" onclick=\"ld(cp)\">\xF0\x9F\x94\x84 \xE5\x88\xB7\xE6\x96\xB0</button></div>\n"
     /* 图片预览模态框 */
     "<div class=\"modal hidden\" id=\"modal\" onclick=\"clsM()\"><span class=\"close\">\xE2\x9C\x95</span><img id=\"modalImg\" src=\"\"><button class=\"dl-btn\" id=\"modalDlBtn\" onclick=\"event.stopPropagation();dl(cf)\">\xE2\xAC\x87 \xE4\xB8\x8B\xE8\xBD\xBD</button></div>\n"
     "<script>\n"
-    "var cp='/sd';var cf='';\n"
+    "var cp='/SD';var cf='';\n"
     "var imgExts={png:1,jpg:1,jpeg:1,gif:1,bmp:1,svg:1,ico:1,webp:1};\n"
     /* WiFi设置 */
     "var setOpen=false;\n"
@@ -134,7 +134,7 @@ static const char INDEX_HTML[] =
     "function rnd(d){\n"
     "if(!d.ok){var h='<div class=\"err\">\xE2\x9A\xA0 '+d.error+'</div>';if(d.code==='SD_NOT_MOUNTED')h+='<div class=\"tip\">\xE8\xAF\xB7\xE5\x9C\xA8Windows\xE4\xB8\x8A\xE5\x8F\xB3\xE9\x94\xAE\xE5\xBC\xB9\xE5\x87\xBAU\xE7\x9B\x98\xEF\xBC\x8C\xE7\x84\xB6\xE5\x90\x8E\xE5\x88\xB7\xE6\x96\xB0\xE3\x80\x82</div>';document.getElementById('content').innerHTML=h;return}\n"
     "document.getElementById('info').textContent=d.entries.length+'\xE4\xB8\xAA\xE9\xA1\xB9\xE7\x9B\xAE | '+(d.entries.filter(function(e){return e.type==='dir'}).length)+'\xE4\xB8\xAA\xE7\x9B\xAE\xE5\xBD\x95';\n"
-    "var b=document.getElementById('bread'),ps=d.path.replace(/\\/+$/,'').split('/').filter(Boolean),h='<a onclick=\"ld(\\'/sd\\')\">/sd</a>',a='/sd';\n"
+    "var b=document.getElementById('bread'),ps=d.path.replace(/\\/+$/,'').split('/').filter(Boolean),h='<a onclick=\"ld(\\'/SD\\')\">/SD</a>',a='/SD';\n"
     "for(var i=1;i<ps.length;i++){a+='/'+ps[i];h+=' / <a onclick=\"ld(\\''+a+'\\')\">'+esc(ps[i])+'</a>'};b.innerHTML=h;\n"
     "var c=document.getElementById('content');\n"
     "if(d.entries.length===0){c.innerHTML='<div class=\"empty\">(\xE7\xA9\xBA\xE7\x9B\xAE\xE5\xBD\x95)</div>';return}\n"
@@ -157,7 +157,7 @@ static const char INDEX_HTML[] =
     "function dl(path){var f=document.createElement('iframe');f.style.display='none';f.src='/api/file?path='+encodeURIComponent(path)+'&action=download';document.body.appendChild(f);setTimeout(function(){document.body.removeChild(f)},10000)}\n"
     "function fsz(b){if(b<1024)return b+'B';if(b<1048576)return (b/1024).toFixed(1)+'K';return (b/1048576).toFixed(1)+'M'}\n"
     "function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}\n"
-    "ld('/sd');\n"
+    "ld('/SD');\n"
     "</script>\n"
     "</body>\n"
     "</html>";

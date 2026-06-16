@@ -81,6 +81,7 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
     printf("[SD] Initializing SDMMC host...\n");                        /* 输出: 正在初始化主机 */
     ret = (*host.init)();                                               /* 调用主机初始化函数指针(初始化SDMMC外设时钟/复位) */
 
+    
     if (ret != ESP_OK)                                                  /* 主机初始化失败 */
     {
         printf("[SD] Host init FAILED: %s\n", esp_err_to_name(ret));    /* 输出错误名称(如"ESP_ERR_INVALID_STATE") */
