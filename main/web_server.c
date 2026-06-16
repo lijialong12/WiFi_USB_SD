@@ -2,17 +2,18 @@
  ****************************************************************************************************
  * @file        web_server.c
  * @author      ONE
- * @version     V1.0
- * @date        2026-06-12
+ * @version     V1.1
+ * @date        2026-06-15
  * @brief       Web文件服务器 - HTTP请求处理实现
  *              功能: ①启动/停止HTTP服务器(端口80) → ②路径安全校验 →
- *                    ③MIME类型检测 → ④目录列表JSON API → ⑤文件预览/下载API
+ *                    ③MIME类型检测 → ④目录列表JSON API → ⑤文件预览/下载API →
+ *                    ⑥从机注册API → ⑦文件删除API
  *              协议: HTTP/1.0 over TCP (LwIP协议栈)
  * @license     重庆博士康科技有限公司版权所有
  ****************************************************************************************************
  * @attention
  *
- * 实验平台: ESP32-S3 WIFI USB SD卡 开发板
+ * 实验平台: ESP32-S3 WIFI USB SD卡 开发板 (DEVICE_ROLE=0 主机端)
  * 安全措施: 所有文件路径经过validate_path()校验, 拒绝目录穿越攻击(../)
  * 性能: 文件下载采用分块传输(httpd_resp_send_chunk), 支持大文件
  * 线程: httpd内部单线程处理请求, 与app_main任务隔离运行
@@ -31,6 +32,7 @@
 #include "tusb_msc_storage.h"                /* TinyUSB MSC: tinyusb_msc_storage_mount */
 #include "nvs.h"                             /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
 #include "esp_system.h"                      /* ESP系统: esp_restart() */
+#include "lwip/sockets.h"                    /* LwIP socket: getpeername, sockaddr_in */
 #include <stdio.h>                           /* 标准I/O: snprintf, fopen, fread, fclose */
 #include <stdlib.h>                          /* 标准库: malloc, free, realloc */
 #include <string.h>                          /* 字符串: strlen, strcpy, strchr, strcmp */
@@ -44,6 +46,7 @@ static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP
 /* ======================== 全局变量 ======================== */
 static httpd_handle_t g_server = NULL;       /* HTTP服务器句柄: NULL=未启动, 非NULL=运行中 */
 static char g_base_path[16] = "/SD";         /* SD卡根路径: 所有文件访问均限制在此目录下 */
+static char g_slave_ip[16] = {0};            /* 已注册从机IP地址 (空=无注册) */
 
 /* ======================== MIME类型映射表 ======================== */
 /* 文件扩展名 → HTTP Content-Type 映射, 用于文件预览和下载 */
@@ -944,6 +947,180 @@ static esp_err_t wifi_config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ======================== 从机注册API (主机端) ======================== */
+
+/**
+ * @brief       从机注册: POST /api/register
+ *              接收从机的注册请求, 记录从机IP地址用于后续文件推送
+ *              Body: {"role":"slave"}
+ *              通过HTTP连接的socket获取从机真实IP
+ * @param       req: HTTP请求对象
+ * @retval      ESP_OK: 注册成功
+ */
+static esp_err_t slave_register_handler(httpd_req_t *req)
+{
+    printf("[WEB_SRV] >>> HANDLER: POST /api/register\n");
+
+    /* ---- 读取POST body ---- */
+    char body[128] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    /* ---- 通过socket获取客户端IP地址 ---- */
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd >= 0) {
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) == 0) {
+            snprintf(g_slave_ip, sizeof(g_slave_ip), "%s", inet_ntoa(addr.sin_addr));
+            printf("[WEB_SRV] Slave registered: IP=%s\n", g_slave_ip);
+        } else {
+            printf("[WEB_SRV] getpeername failed\n");
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Cannot determine client IP\"}");
+            return ESP_FAIL;
+        }
+    } else {
+        /* 降级: 从请求头X-Forwarded-For获取(如有) */
+        size_t hdr_len = httpd_req_get_hdr_value_len(req, "X-Forwarded-For");
+        if (hdr_len > 0) {
+            char *hdr_val = malloc(hdr_len + 1);
+            if (hdr_val) {
+                httpd_req_get_hdr_value_str(req, "X-Forwarded-For", hdr_val, hdr_len + 1);
+                strncpy(g_slave_ip, hdr_val, sizeof(g_slave_ip) - 1);
+                g_slave_ip[sizeof(g_slave_ip) - 1] = '\0';
+                free(hdr_val);
+                printf("[WEB_SRV] Slave registered (via X-Forwarded-For): IP=%s\n", g_slave_ip);
+            }
+        }
+        if (g_slave_ip[0] == '\0') {
+            printf("[WEB_SRV] Cannot determine slave IP\n");
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Cannot determine client IP\"}");
+            return ESP_FAIL;
+        }
+    }
+
+    /* ---- 返回成功 ---- */
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"registered\"}");
+
+    printf("[WEB_SRV] <<< DONE: POST /api/register → slave at %s\n", g_slave_ip);
+    return ESP_OK;
+}
+
+/* ======================== 文件删除API (主机端) ======================== */
+
+/**
+ * @brief       删除文件: POST /api/delete
+ *              Body: {"path":"/SD/filename.txt"}
+ *              路径经过安全校验, 仅允许删除/SD下的文件
+ * @param       req: HTTP请求对象
+ * @retval      ESP_OK: 删除成功
+ */
+static esp_err_t file_delete_handler(httpd_req_t *req)
+{
+    printf("[WEB_SRV] >>> HANDLER: POST /api/delete\n");
+
+    /* ---- 读取POST body ---- */
+    char body[512] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Empty body\",\"code\":\"EMPTY_BODY\"}");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    /* 解析 "path" 字段 */
+    char raw_path[512] = {0};
+    const char *path_key = strstr(body, "\"path\"");
+    if (path_key) {
+        const char *val_start = strchr(path_key, ':');
+        if (val_start) {
+            val_start++;
+            while (*val_start == ' ' || *val_start == '"') val_start++;
+            const char *val_end = strchr(val_start, '"');
+            if (val_end) {
+                size_t len = val_end - val_start;
+                if (len >= sizeof(raw_path)) len = sizeof(raw_path) - 1;
+                memcpy(raw_path, val_start, len);
+                raw_path[len] = '\0';
+            }
+        }
+    }
+
+    if (raw_path[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Missing 'path' parameter\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 路径安全校验 ---- */
+    char norm_path[512] = {0};
+    if (!validate_path(raw_path, norm_path, sizeof(norm_path))) {
+        printf("[WEB_SRV] DELETE rejected invalid path: %s\n", raw_path);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Invalid path\",\"code\":\"INVALID_PATH\"}");
+        return ESP_FAIL;
+    }
+
+    /* 拒绝删除根目录/SD */
+    if (strcmp(norm_path, "/SD") == 0) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Cannot delete root\",\"code\":\"ROOT_DENIED\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 检查文件存在 ---- */
+    struct stat st;
+    if (stat(norm_path, &st) != 0) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"File not found\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 执行删除 ---- */
+    if (S_ISDIR(st.st_mode)) {
+        /* 目录: 使用rmdir (仅空目录) */
+        if (rmdir(norm_path) != 0) {
+            printf("[WEB_SRV] DELETE rmdir FAILED: %s\n", norm_path);
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Cannot remove directory\"}");
+            return ESP_FAIL;
+        }
+        printf("[WEB_SRV] DELETE dir OK: %s\n", norm_path);
+    } else {
+        /* 文件: 使用remove */
+        if (remove(norm_path) != 0) {
+            printf("[WEB_SRV] DELETE remove FAILED: %s\n", norm_path);
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Cannot remove file\"}");
+            return ESP_FAIL;
+        }
+        printf("[WEB_SRV] DELETE file OK: %s\n", norm_path);
+    }
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+
+    printf("[WEB_SRV] <<< DONE: POST /api/delete → %s\n", norm_path);
+    return ESP_OK;
+}
+
 /* ======================== 公开API ======================== */
 
 /**
@@ -986,7 +1163,7 @@ esp_err_t web_server_start(void)
 
     /* ---- 创建HTTP服务器配置 ---- */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;                                /* 当前6个处理器(含2个wifi-config) */
+    config.max_uri_handlers = 12;                                /* 当前8个处理器 */
     config.stack_size = 8192;                                   /* 8KB栈: 足够文件I/O操作 */
     config.server_port = 80;                                    /* 标准HTTP端口 */
 
@@ -1095,6 +1272,34 @@ esp_err_t web_server_start(void)
     }
     printf("[WEB_SRV] Registered: POST /api/wifi-config\n");
 
+    /* ---- 注册URI处理器: POST /api/register (从机注册) ---- */
+    httpd_uri_t uri_register = {
+        .uri       = "/api/register",
+        .method    = HTTP_POST,
+        .handler   = slave_register_handler,
+        .user_ctx  = NULL
+    };
+    ret = httpd_register_uri_handler(g_server, &uri_register);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register POST /api/register handler");
+    } else {
+        printf("[WEB_SRV] Registered: POST /api/register\n");
+    }
+
+    /* ---- 注册URI处理器: POST /api/delete (文件删除) ---- */
+    httpd_uri_t uri_delete = {
+        .uri       = "/api/delete",
+        .method    = HTTP_POST,
+        .handler   = file_delete_handler,
+        .user_ctx  = NULL
+    };
+    ret = httpd_register_uri_handler(g_server, &uri_delete);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register POST /api/delete handler");
+    } else {
+        printf("[WEB_SRV] Registered: POST /api/delete\n");
+    }
+
     printf("[WEB_SRV] Web file server ready at http://192.168.3.1\n");
     ESP_LOGI(TAG, "Web file server started successfully");
     return ESP_OK;
@@ -1122,4 +1327,28 @@ esp_err_t web_server_stop(void)
         ESP_LOGE(TAG, "Failed to stop server: %s", esp_err_to_name(ret));
     }
     return ret;
+}
+
+/* ======================== 从机IP查询 ======================== */
+
+/**
+ * @brief       获取已注册从机的IP地址
+ */
+bool web_server_get_slave_ip(char *ip_buf, size_t buf_size)
+{
+    if (g_slave_ip[0] == '\0' || ip_buf == NULL || buf_size == 0) {
+        return false;
+    }
+    strncpy(ip_buf, g_slave_ip, buf_size - 1);
+    ip_buf[buf_size - 1] = '\0';
+    return true;
+}
+
+/**
+ * @brief       清除从机注册状态
+ */
+void web_server_clear_slave(void)
+{
+    printf("[WEB_SRV] Slave cleared (was: %s)\n", g_slave_ip[0] ? g_slave_ip : "none");
+    g_slave_ip[0] = '\0';
 }
