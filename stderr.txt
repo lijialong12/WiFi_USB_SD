@@ -1,2 +1,0 @@
-C:\Espressif\frameworks\esp-idf-v5.4.1\tools\idf.py:368: DeprecationWarning: 'MultiCommand' is deprecated and will be removed in Click 9.0. Use 'Group' instead.
-  class CLI(click.MultiCommand):
