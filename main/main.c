@@ -148,9 +148,10 @@ static void switch_to_usb_mode(void)
     printf("[模式] → USB模式 (本地卸载 + USB连接)\n");  /* 打印切换提示 */
     tinyusb_msc_storage_unmount();                     /* 卸载本地FATFS挂载，释放SD卡 */
     g_wifi_mode = false;                               /* 清除WiFi模式标志 */
-    vTaskDelay(pdMS_TO_TICKS(300));                    /* 延迟300ms，等待卸载完成 */
+    vTaskDelay(pdMS_TO_TICKS(500));                    /* 延迟500ms，确保卸载完成 */
     tud_connect();                                     /* 重新连接USB，PC会看到U盘插入 */
-    printf("[模式] USB模式就绪\n");                    /* 打印就绪信息 */
+    vTaskDelay(pdMS_TO_TICKS(1000));                    /* 等待1秒，让USB稳定 */
+    printf("[模式] USB模式就绪 (connected=%d)\n", tud_connected()); /* 打印就绪信息+状态 */
 #endif
 }
 
@@ -411,37 +412,36 @@ void app_main(void)
     /* LED初始化 */
     led_init();                              /* 初始化LED */
     LED(1);                                  /* 点亮LED */
-    vTaskDelay(pdMS_TO_TICKS(6000));         /* 等待6秒，确保USB枚举完成 */
     setvbuf(stdout, NULL, _IONBF, 0);        /* 设置标准输出为无缓冲，便于实时查看日志 */
     printf("\n========== 从机 V2.0 (自动接收) ==========\n"); /* 打印标题 */
 
-    /* ---------- SD卡 + USB MSC 初始化 ----------
-     * 默认以USB U盘模式启动，PC可直接访问SD卡。
-     * 接收文件时再切换到本地模式，接收完毕后切回。 */
+    /* ---------- SD卡初始化 ---------- */
     sdmmc_card_t *sd_card = NULL;            /* SD卡句柄 */
     esp_err_t sd_ret = sd_card_init(&sd_card); /* 初始化SD卡 */
     g_sd_ok = (sd_ret == ESP_OK && sd_card != NULL); /* 记录SD卡是否就绪 */
 
-    if (g_sd_ok) {                           /* SD卡初始化成功 */
-        printf("[主函数] SD卡就绪\n");       /* 打印成功信息 */
-#if USE_USB_MSC
-        printf("[主函数] 初始化 USB MSC...\n"); /* 打印USB MSC初始化提示 */
-        ESP_ERROR_CHECK(usb_msc_init(sd_card)); /* 初始化USB MSC，注册SD卡给TinyUSB */
-        tud_connect();                       /* 连接USB，让PC能识别U盘 */
-        printf("[主函数] USB MSC 就绪，PC可访问SD卡\n"); /* 打印就绪信息 */
-#endif
-    } else {                                 /* SD卡初始化失败 */
+    if (!g_sd_ok) {                          /* SD卡初始化失败 */
         printf("[主函数] SD卡初始化失败: %s\n", esp_err_to_name(sd_ret)); /* 打印失败原因 */
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }  /* 死机 */
     }
+    printf("[主函数] SD卡就绪\n");           /* 打印成功信息 */
 
-    /* ---------- WiFi STA 初始化 ----------
-     * 注意: 主端可能还没开机，热点不存在是正常的。
-     * 连接失败不重启，进主循环后持续等待热点出现。
-     * WiFi驱动会在后台自动重连（事件回调里有重试逻辑）。 */
-    printf("[主函数] 启动WiFi STA (主机热点可能尚未开启)...\n"); /* 打印WiFi初始化提示 */
-    wifi_init_sta();   /* 初始化WiFi STA，尝试连接主端热点 */
+    /* ---------- USB MSC 初始化（优先，确保PC能识别U盘）---------- */
+#if USE_USB_MSC
+    printf("[主函数] 初始化 USB MSC...\n"); /* 打印USB MSC初始化提示 */
+    ESP_ERROR_CHECK(usb_msc_init(sd_card)); /* 初始化USB MSC，注册SD卡给TinyUSB */
+    printf("[主函数] USB MSC驱动已安装\n");
+    vTaskDelay(pdMS_TO_TICKS(100));         /* 短暂延迟 */
+    tud_connect();                           /* 立即连接USB，让PC能识别U盘 */
+    vTaskDelay(pdMS_TO_TICKS(2000));         /* 等待2秒，让USB稳定，PC识别 */
+    printf("[主函数] USB MSC 就绪，PC可访问SD卡 (connected=%d)\n", tud_connected()); /* 打印就绪信息 */
+#endif
 
     LED(0);                                  /* 关闭LED */
+
+    /* ---------- WiFi STA 初始化（最后初始化，避免影响USB）---------- */
+    printf("[主函数] 启动WiFi STA (主机热点可能尚未开启)...\n"); /* 打印WiFi初始化提示 */
+    wifi_init_sta();   /* 初始化WiFi STA，尝试连接主端热点 */
     printf("[主函数] 准备就绪 (USB模式)。等待主机WiFi...\n"); /* 打印等待提示 */
 
     /* ======================== 主循环 ========================
