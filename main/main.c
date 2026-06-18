@@ -1,30 +1,31 @@
 /**
  ****************************************************************************************************
- * @file        main.c  (主端)
+ * @file        main.c  (从端)
  * @author      ONE
- * @version     V3.0
+ * @version     V2.0
  * @date        2026-06-17
- * @brief       主端程序 - USB MSC + WiFi AP + 主从自动文件传输（修复版）
+ * @brief       从端程序 - USB MSC + WiFi STA + 主从自动文件接收
  *
- *              流程: USB模式(PC拷贝文件) → 检测从机连接WiFi →
- *                    检查SD卡是否有文件(仍在USB模式，不可直接读，需先切换)→
- *                    切换WiFi模式 → 检查SD卡文件 → TCP发送文件 →
- *                    删除SD所有文件 → 切回USB模式
+ *              流程: 上电 → USB U盘模式待机(PC可访问SD) →
+ *                    连接主机WiFi热点 → 轮询TCP连接主机 →
+ *                    TCP连上后：切换到WiFi本地模式(USB断开) →
+ *                    握手 → 接收文件写入SD → 回ACK →
+ *                    切回USB U盘模式 → 等待下一轮
  *
- * @修复清单
- *  [BUG-1] cleanup_no_transfer 标签：挂载失败时仍调用 switch_to_usb_mode，
- *          现改为用 g_wifi_mode 标志条件判断是否需要切回
- *  [BUG-2] size_t remain 截断 uint64_t 文件大小，改为 uint64_t remain
- *  [BUG-3] 主循环竞态：xTaskCreate 前先置 g_transfer_busy = true
- *  [BUG-4] files[MAX_FILES] 放栈上导致栈溢出(26KB)，改为堆分配
- *  [BUG-5] send() 未循环，新增 send_all() 封装确保完整发送
+ *              关键点: 只有在实际传输期间才切换到本地模式，
+ *                      平时保持USB U盘模式，PC可以正常访问SD卡。
  *
- * @逻辑修复
- *  [LOGIC-1] 无文件时不再切换WiFi模式再切回，避免PC看到U盘插拔
- *  [LOGIC-2] 传输任务结束后主动重置 g_sta_count，避免下次循环误触发
- *  [LOGIC-3] recv(ack) 补加超时，防止从机不响应时永久阻塞
- *  [LOGIC-4] 删除文件后调用 fsync/sync 确保文件系统落盘再切回USB
- *  [LOGIC-5] switch_to_wifi_mode 失败时提前返回，不再走后续逻辑
+ * @协议说明（与主端对齐）
+ *  主→从: "MASTER_SEND"        (握手发起，11字节)
+ *  从→主: "READY"              (握手应答，5字节)
+ *  主→从: uint32_t file_count  (大端，文件总数)
+ *  循环 file_count 次:
+ *    主→从: uint16_t name_len  (大端，文件名字节数)
+ *    主→从: char name[name_len](文件名，无终止符)
+ *    主→从: uint64_t file_size (大端，文件字节数)
+ *    主→从: uint8_t data[file_size] (文件内容)
+ *  主→从: "DONE"               (所有文件发完，4字节)
+ *  从→主: "ACK"                (最终确认，3字节)
  *
  * @license     重庆博士康科技有限公司版权所有
  ****************************************************************************************************
@@ -40,12 +41,13 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "led.h"
 #include "sd_card.h"
 #if USE_USB_MSC
@@ -56,85 +58,72 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "dirent.h"
 #include "sys/stat.h"
 #include "unistd.h"
 
 /* ======================== 字节序转换宏 ======================== */
-#ifndef htobe64
-#define htobe64(x)  __builtin_bswap64(x)
+#ifndef be64toh
+#define be64toh(x)  __builtin_bswap64(x)
 #endif
 
-/* ======================== WiFi AP 配置 ======================== */
-static const char *TAG = "MASTER";
-#define WIFI_SSID       "BOSSCOM_USB_AP"
-#define WIFI_PASS       "012345678"
-#define MAX_STA_CONN    5
-#define MAC2STR(a)      (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
-#define MACSTR          "%02x:%02x:%02x:%02x:%02x:%02x"
+/* ======================== WiFi STA 配置 ======================== */
+static const char *TAG = "SLAVE";
 
-/* ======================== 主从传输配置 ======================== */
-#define TRANSFER_PORT           3333    /* TCP监听端口 */
-#define TRANSFER_WAIT_TIMEOUT   20      /* 等待从机连接超时(秒) */
-#define TRANSFER_ACK_TIMEOUT    10      /* 等待从机握手ACK超时(秒) */
+#define MASTER_SSID             "BOSSCOM_USB_AP"  /* 主机热点名，需与主端一致 */
+#define MASTER_PASS             "012345678"        /* 主机热点密码 */
+#define MASTER_IP               "192.168.4.1"      /* 主机固定IP（SoftAP默认） */
+#define MASTER_PORT             3333               /* 与主端 TRANSFER_PORT 一致 */
+
+#define WIFI_CONNECT_TIMEOUT_S  30                 /* WiFi连接超时(秒) */
+#define WIFI_MAX_RETRY          10                 /* STA连接最大重试次数 */
+#define TCP_CONNECT_RETRY       5                  /* TCP连接失败重试次数 */
+#define TCP_CONNECT_RETRY_MS    2000               /* 每次重试间隔(ms) */
+#define TCP_RECV_TIMEOUT_S      30                 /* TCP收数据超时(秒) */
+
 #define SD_MOUNT_POINT          "/sd"
-#define MAX_FILES               100     /* 单次最大发送文件数 */
-#define FILE_SEND_BUF_SIZE      4096    /* 文件发送缓冲区，堆分配 */
+#define FILE_RECV_BUF_SIZE      4096               /* 接收缓冲区（堆分配） */
+
+/* ======================== WiFi 事件组 ======================== */
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
+
+static EventGroupHandle_t s_wifi_event_group = NULL;
+static int                s_retry_num        = 0;
 
 /* ======================== 全局状态 ======================== */
-static int           g_sta_count    = 0;     /* 当前STA连接数 */
-static bool          g_wifi_mode    = false; /* 当前是否为WiFi本地模式 */
-static volatile bool g_transfer_busy = false; /* 传输任务忙标志 */
+static bool g_sd_ok          = false;
+static bool g_wifi_connected = false;
+static bool g_wifi_mode      = false;  /* true=本地挂载模式, false=USB MSC模式 */
 
 /* ======================== 函数声明 ======================== */
 static bool switch_to_wifi_mode(void);
 static void switch_to_usb_mode(void);
-static int  send_all(int sock, const void *buf, size_t len);
-static void file_transfer_task(void *arg);
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data);
-static void wifi_init_softap(void);
+static bool wifi_init_sta(void);
+static int  recv_all(int sock, void *buf, size_t len);
+static bool do_file_receive_after_handshake(int sock);
 
-/* ======================== 安全发送封装 ======================== */
+/* ======================== 模式切换 ======================== */
 /**
- * @brief  循环发送直到全部发完或出错
- *         修复[BUG-5]: 原代码 send() 一次调用不保证全部发出
- * @return 0=成功, -1=出错
- */
-static int send_all(int sock, const void *buf, size_t len)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len > 0) {
-        int r = send(sock, p, len, 0);
-        if (r <= 0) return -1;
-        p   += r;
-        len -= r;
-    }
-    return 0;
-}
-
-/* ======================== 模式切换实现 ======================== */
-/**
- * @brief  切换到WiFi本地模式（断开USB，本地挂载SD）
- * @return true=成功, false=失败
- *
- * 修复[LOGIC-5]: 返回bool，调用方可判断是否成功，失败时不继续走传输流程
+ * @brief  切换到WiFi本地模式（断开USB，ESP32本地挂载SD）
+ *         在TCP连上、准备接收文件前调用
+ * @return true=成功, false=挂载失败
  */
 static bool switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
-    if (g_wifi_mode) return true;   /* 已在WiFi模式，幂等 */
+    if (g_wifi_mode) return true;   /* 已在本地模式，幂等 */
 
     printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
-    tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(800)); /* 等待PC处理U盘移除事件 */
+    tud_disconnect();                                  /* PC看到U盘移除 */
+    vTaskDelay(pdMS_TO_TICKS(800));                    /* 等待PC处理弹出事件 */
     tinyusb_msc_storage_unmount();
 
     esp_err_t ret = tinyusb_msc_storage_mount(SD_MOUNT_POINT);
     if (ret != ESP_OK) {
         printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
-        /* 挂载失败：尝试重新连上USB，不改变 g_wifi_mode */
-        tud_connect();
+        tud_connect();    /* 挂载失败，重新连上USB */
         return false;
     }
     g_wifi_mode = true;
@@ -147,9 +136,8 @@ static bool switch_to_wifi_mode(void)
 }
 
 /**
- * @brief  切换到USB U盘模式（卸载本地挂载，启用USB MSC）
- *
- * 修复[BUG-1]: 只有 g_wifi_mode==true 时才执行，避免未挂载时误调用
+ * @brief  切换回USB U盘模式（卸载本地挂载，重新连接USB）
+ *         在文件接收完成后调用
  */
 static void switch_to_usb_mode(void)
 {
@@ -162,43 +150,74 @@ static void switch_to_usb_mode(void)
     tinyusb_msc_storage_unmount();
     g_wifi_mode = false;
     vTaskDelay(pdMS_TO_TICKS(300));
-    tud_connect();
-    printf("[MODE] USB mode OK, PC can access SD\n");
+    tud_connect();                                     /* PC重新看到U盘插入 */
+    printf("[MODE] USB mode OK\n");
 #endif
+}
+
+/* ======================== 安全接收封装 ======================== */
+/**
+ * @brief  循环接收直到收满 len 字节或出错/超时
+ * @return 0=成功, -1=出错或对端关闭
+ */
+static int recv_all(int sock, void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        int r = recv(sock, p, len, 0);
+        if (r <= 0) return -1;
+        p   += r;
+        len -= r;
+    }
+    return 0;
 }
 
 /* ======================== WiFi 事件处理 ======================== */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
-        g_sta_count++;
-        ESP_LOGI(TAG, "Station " MACSTR " connected, total:%d",
-                 MAC2STR(e->mac), g_sta_count);
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
     }
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)event_data;
-        if (g_sta_count > 0) g_sta_count--;
-        ESP_LOGI(TAG, "Station " MACSTR " disconnected, total:%d",
-                 MAC2STR(e->mac), g_sta_count);
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        g_wifi_connected = false;
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "Retry WiFi (%d/%d)...", s_retry_num, WIFI_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            ESP_LOGE(TAG, "WiFi failed after %d retries", WIFI_MAX_RETRY);
+        }
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        s_retry_num      = 0;
+        g_wifi_connected = true;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-/* ======================== WiFi SoftAP 初始化 ======================== */
-static void wifi_init_softap(void)
+/* ======================== WiFi STA 初始化 ======================== */
+static bool wifi_init_sta(void)
 {
+    s_wifi_event_group = xEventGroupCreate();
+
     esp_netif_init();
     esp_event_loop_create_default();
-    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               &wifi_event_handler, NULL));
 
-    char ssid[32] = WIFI_SSID;
-    char pass[64] = WIFI_PASS;
+    char ssid[32] = MASTER_SSID;
+    char pass[64] = MASTER_PASS;
     nvs_handle_t nvs;
     if (nvs_open("wifi_cfg", NVS_READONLY, &nvs) == ESP_OK) {
         size_t len = sizeof(ssid);
@@ -209,367 +228,175 @@ static void wifi_init_softap(void)
     }
 
     wifi_config_t wifi_cfg = {
-        .ap = {
-            .ssid_len       = strlen(ssid),
-            .max_connection = MAX_STA_CONN,
-            .authmode       = WIFI_AUTH_WPA_WPA2_PSK,
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            .pmf_cfg = { .capable = true, .required = false },
         },
     };
-    memcpy(wifi_cfg.ap.ssid,     ssid, sizeof(wifi_cfg.ap.ssid));
-    memcpy(wifi_cfg.ap.password, pass, sizeof(wifi_cfg.ap.password));
-    if (strlen(pass) == 0) wifi_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    strncpy((char *)wifi_cfg.sta.ssid,     ssid, sizeof(wifi_cfg.sta.ssid));
+    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    esp_netif_ip_info_t ip;
-    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip);
-    ESP_LOGI(TAG, "AP started: SSID=%s, IP=" IPSTR, ssid, IP2STR(&ip.ip));
+    ESP_LOGI(TAG, "Connecting to AP: %s ...", ssid);
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_S * 1000)
+    );
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected: %s", ssid);
+        return true;
+    }
+    ESP_LOGE(TAG, "WiFi connect timeout/failed");
+    return false;
 }
 
-/* ======================== 文件信息结构 ======================== */
-typedef struct {
-    char     name[256];
-    uint64_t size;
-} file_info_t;
-
-/* ======================== 文件传输任务 ======================== */
+/* ======================== 文件接收核心逻辑 ======================== */
 /**
- * @brief  主从文件传输任务
- *
- *  步骤:
- *   1. 先切换到WiFi本地模式（让SD可读）
- *   2. 检查SD卡是否有文件，无文件则直接切回USB退出
- *   3. 创建TCP服务器等待从机连接（带超时）
- *   4. 握手：发 MASTER_SEND → 等从机回 READY（带ACK超时）
- *   5. 堆上收集文件列表，发送文件总数+每个文件名/大小/内容
- *   6. 发送 DONE，等从机最终ACK
- *   7. 删除SD卡所有文件，sync落盘
- *   8. 切回USB模式
- *   9. 重置 g_sta_count 和 g_transfer_busy
- *
- *  修复汇总:
- *   [BUG-2] remain 改为 uint64_t
- *   [BUG-3] 由调用方在 xTaskCreate 前置位 g_transfer_busy
- *   [BUG-4] file_info_t 数组改为堆分配
- *   [BUG-5] 所有 send 改用 send_all
- *   [LOGIC-1] 无文件时不切WiFi模式（直接切回USB即可，此时还未切换）
- *   [LOGIC-2] 任务结束时重置 g_sta_count
- *   [LOGIC-3] recv ACK 加超时
- *   [LOGIC-4] 删文件后 sync
+ * @brief  握手已在主循环完成后，接收文件数+文件内容+DONE/ACK
+ *         调用前：switch_to_wifi_mode() 已成功，READY 已发出
  */
-static void file_transfer_task(void *arg)
+static bool do_file_receive_after_handshake(int sock)
 {
-    printf("[TRANSFER] Task started\n");
+    char *recv_buf = NULL;
+    FILE *fp       = NULL;
+    bool  success  = false;
 
-    int         listen_sock = -1;
-    int         client_sock = -1;
-    file_info_t *files      = NULL;
-    bool        entered_wifi_mode = false;  /* 记录本次任务是否成功切入WiFi模式 */
-
-    /* --------------------------------------------------------
-     * 步骤1: 切换到WiFi本地模式
-     * --------------------------------------------------------
-     * 注意: 在USB模式下 SD 由 TinyUSB 控制，ESP32本地无法直接读写。
-     *       必须先切换到本地模式才能检查和读取文件。
-     * -------------------------------------------------------- */
-    if (!switch_to_wifi_mode()) {
-        printf("[TRANSFER] Cannot enter WiFi mode, abort\n");
-        goto task_exit;
-    }
-    entered_wifi_mode = true;
-
-    /* --------------------------------------------------------
-     * 步骤2: 检查SD卡是否有文件
-     * 修复[LOGIC-1]: 切换WiFi模式之后再检查，而非之前
-     * -------------------------------------------------------- */
+    /* ---------- 1. 收文件总数 ---------- */
+    uint32_t file_count = 0;
     {
-        DIR *dir = opendir(SD_MOUNT_POINT);
-        if (!dir) {
-            printf("[TRANSFER] Cannot open SD dir: %s\n", SD_MOUNT_POINT);
-            goto task_exit;
+        uint32_t count_net = 0;
+        if (recv_all(sock, &count_net, sizeof(count_net)) != 0) {
+            ESP_LOGE(TAG, "Recv file count failed");
+            goto recv_exit;
         }
-        bool has_file = false;
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG) { has_file = true; break; }
-        }
-        closedir(dir);
-
-        if (!has_file) {
-            printf("[TRANSFER] No files on SD, skip transfer\n");
-            goto task_exit;     /* 无文件，切回USB退出 */
+        file_count = ntohl(count_net);
+        ESP_LOGI(TAG, "Expecting %lu file(s)", (unsigned long)file_count);
+        if (file_count == 0) {
+            success = true;     /* 主端无文件，正常结束 */
+            goto recv_exit;
         }
     }
 
-    /* --------------------------------------------------------
-     * 步骤3: 创建TCP服务器，等待从机连接
-     * -------------------------------------------------------- */
-    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock < 0) {
-        printf("[TRANSFER] socket() failed\n");
-        goto task_exit;
+    /* ---------- 3. 堆分配接收缓冲区 ---------- */
+    recv_buf = (char *)malloc(FILE_RECV_BUF_SIZE);
+    if (!recv_buf) {
+        ESP_LOGE(TAG, "malloc recv_buf failed");
+        goto recv_exit;
     }
 
-    {
-        int opt = 1;
-        setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    }
+    /* ---------- 4. 循环接收每个文件 ---------- */
+    for (uint32_t i = 0; i < file_count; i++) {
 
-    {
-        struct sockaddr_in addr = {0};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        addr.sin_port        = htons(TRANSFER_PORT);
-        if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            printf("[TRANSFER] bind() failed\n");
-            goto task_exit;
+        /* 4a. 收文件名长度 */
+        uint16_t name_len_net = 0;
+        if (recv_all(sock, &name_len_net, sizeof(name_len_net)) != 0) {
+            ESP_LOGE(TAG, "Recv name_len failed at file %lu", (unsigned long)i);
+            goto recv_exit;
         }
-    }
-
-    if (listen(listen_sock, 1) != 0) {
-        printf("[TRANSFER] listen() failed\n");
-        goto task_exit;
-    }
-
-    /* 等待从机连接的超时 */
-    {
-        struct timeval tv = { .tv_sec = TRANSFER_WAIT_TIMEOUT, .tv_usec = 0 };
-        setsockopt(listen_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    }
-
-    printf("[TRANSFER] Listening on port %d, waiting slave (timeout=%ds)...\n",
-           TRANSFER_PORT, TRANSFER_WAIT_TIMEOUT);
-
-    {
-        struct sockaddr_in cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        client_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_len);
-        if (client_sock < 0) {
-            printf("[TRANSFER] accept() timeout or error, abort\n");
-            goto task_exit;
-        }
-        printf("[TRANSFER] Slave connected: %s\n", inet_ntoa(cli_addr.sin_addr));
-    }
-
-    /* 给已连接的socket也设一个收发超时，防握手阻塞
-     * 修复[LOGIC-3]: 原代码 recv(ack) 无超时，从机不回应时永久阻塞 */
-    {
-        struct timeval tv = { .tv_sec = TRANSFER_ACK_TIMEOUT, .tv_usec = 0 };
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-
-    /* --------------------------------------------------------
-     * 步骤4: 握手
-     * -------------------------------------------------------- */
-    {
-        const char *handshake = "MASTER_SEND";
-        if (send_all(client_sock, handshake, strlen(handshake)) != 0) {
-            printf("[TRANSFER] Handshake send failed\n");
-            goto task_exit;
+        uint16_t name_len = ntohs(name_len_net);
+        if (name_len == 0 || name_len > 255) {
+            ESP_LOGE(TAG, "Invalid name_len=%u", name_len);
+            goto recv_exit;
         }
 
-        char ack[16] = {0};
-        int  n = recv(client_sock, ack, sizeof(ack) - 1, 0);
-        if (n <= 0 || strncmp(ack, "READY", 5) != 0) {
-            printf("[TRANSFER] Slave not ready (n=%d, ack='%s')\n", n, ack);
-            goto task_exit;
+        /* 4b. 收文件名 */
+        char file_name[256] = {0};
+        if (recv_all(sock, file_name, name_len) != 0) {
+            ESP_LOGE(TAG, "Recv filename failed at file %lu", (unsigned long)i);
+            goto recv_exit;
         }
-        printf("[TRANSFER] Slave ready, sending files...\n");
-    }
+        file_name[name_len] = '\0';
 
-    /* --------------------------------------------------------
-     * 步骤5: 收集文件列表（堆分配）
-     * 修复[BUG-4]: 原来放栈上，100个文件≈26KB，必然栈溢出
-     * -------------------------------------------------------- */
-    files = (file_info_t *)malloc(sizeof(file_info_t) * MAX_FILES);
-    if (!files) {
-        printf("[TRANSFER] malloc file_info failed\n");
-        goto task_exit;
-    }
-
-    int file_cnt = 0;
-    {
-        DIR *dir = opendir(SD_MOUNT_POINT);
-        if (!dir) {
-            printf("[TRANSFER] Cannot reopen SD dir\n");
-            uint32_t zero = 0;
-            send_all(client_sock, &zero, sizeof(zero));
-            goto task_exit;
+        /* 4c. 收文件大小（大端64位） */
+        uint64_t file_size_be = 0;
+        if (recv_all(sock, &file_size_be, sizeof(file_size_be)) != 0) {
+            ESP_LOGE(TAG, "Recv file_size failed: %s", file_name);
+            goto recv_exit;
         }
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL && file_cnt < MAX_FILES) {
-            if (entry->d_type == DT_REG) {
-                char path[300];
-                snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, entry->d_name);
-                struct stat st;
-                if (stat(path, &st) == 0) {
-                    strncpy(files[file_cnt].name, entry->d_name, 255);
-                    files[file_cnt].name[255] = '\0'; /* 确保终止符 */
-                    files[file_cnt].size = (uint64_t)st.st_size;
-                    file_cnt++;
-                }
+        uint64_t file_size = be64toh(file_size_be);
+        ESP_LOGI(TAG, "[%lu/%lu] %s (%llu bytes)",
+                 (unsigned long)(i + 1), (unsigned long)file_count,
+                 file_name, (unsigned long long)file_size);
+
+        /* 4d. 创建目标文件（先删旧文件，避免残留） */
+        char path[300];
+        snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, file_name);
+        unlink(path);
+
+        fp = fopen(path, "wb");
+        if (!fp) {
+            ESP_LOGE(TAG, "Cannot create: %s, discarding %llu bytes",
+                     path, (unsigned long long)file_size);
+            /* 文件无法创建，仍需把字节全部读完保持协议同步 */
+            uint64_t discard = file_size;
+            while (discard > 0) {
+                size_t chunk = (discard > FILE_RECV_BUF_SIZE) ?
+                               FILE_RECV_BUF_SIZE : (size_t)discard;
+                if (recv_all(sock, recv_buf, chunk) != 0) goto recv_exit;
+                discard -= chunk;
             }
+            continue;
         }
-        closedir(dir);
+
+        /* 4e. 循环接收并写入SD */
+        uint64_t remain = file_size;
+        while (remain > 0) {
+            size_t chunk = (remain > FILE_RECV_BUF_SIZE) ?
+                           FILE_RECV_BUF_SIZE : (size_t)remain;
+            if (recv_all(sock, recv_buf, chunk) != 0) {
+                ESP_LOGE(TAG, "Recv data lost: %s", file_name);
+                fclose(fp); fp = NULL;
+                goto recv_exit;
+            }
+            size_t written = fwrite(recv_buf, 1, chunk, fp);
+            if (written != chunk) {
+                ESP_LOGE(TAG, "SD write failed: %s", file_name);
+                fclose(fp); fp = NULL;
+                goto recv_exit;
+            }
+            remain -= chunk;
+        }
+        fclose(fp); fp = NULL;
+        ESP_LOGI(TAG, "Saved: %s", path);
     }
 
-    /* 发送文件总数 */
+    /* ---------- 5. 收 "DONE"，回 "ACK" ---------- */
     {
-        uint32_t count_net = htonl((uint32_t)file_cnt);
-        if (send_all(client_sock, &count_net, sizeof(count_net)) != 0) {
-            printf("[TRANSFER] Send file count failed\n");
-            goto task_exit;
+        char done_buf[8] = {0};
+        if (recv_all(sock, done_buf, 4) != 0) {         /* "DONE" = 4字节 */
+            ESP_LOGE(TAG, "Recv DONE failed");
+            goto recv_exit;
         }
-        printf("[TRANSFER] Will send %d file(s)\n", file_cnt);
-    }
-
-    /* 发送每个文件 */
-    {
-        /* 文件内容发送缓冲区也堆分配，节省栈空间 */
-        char *send_buf = (char *)malloc(FILE_SEND_BUF_SIZE);
-        if (!send_buf) {
-            printf("[TRANSFER] malloc send_buf failed\n");
-            goto task_exit;
+        done_buf[4] = '\0';
+        if (strncmp(done_buf, "DONE", 4) != 0) {
+            ESP_LOGE(TAG, "Expected DONE, got '%s'", done_buf);
+            goto recv_exit;
         }
+        send(sock, "ACK", 3, 0);
+        ESP_LOGI(TAG, "All done, ACK sent");
 
-        for (int i = 0; i < file_cnt; i++) {
-            /* 发送文件名长度 + 文件名 */
-            uint16_t name_len     = (uint16_t)strlen(files[i].name);
-            uint16_t name_len_net = htons(name_len);
-            if (send_all(client_sock, &name_len_net, sizeof(name_len_net)) != 0 ||
-                send_all(client_sock, files[i].name, name_len)             != 0) {
-                printf("[TRANSFER] Send filename failed: %s\n", files[i].name);
-                free(send_buf);
-                goto task_exit;
-            }
-
-            /* 发送文件大小（大端64位）*/
-            uint64_t size_be = htobe64(files[i].size);
-            if (send_all(client_sock, &size_be, sizeof(size_be)) != 0) {
-                printf("[TRANSFER] Send file size failed: %s\n", files[i].name);
-                free(send_buf);
-                goto task_exit;
-            }
-
-            /* 发送文件内容 */
-            char path[300];
-            snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, files[i].name);
-            FILE *fp = fopen(path, "rb");
-            if (!fp) {
-                printf("[TRANSFER] Open failed: %s\n", path);
-                /* 已承诺发这个文件，打开失败需要告知从机：发全0填充
-                 * （从机需要读完对应字节数才能继续接收下一文件）*/
-                uint64_t remain = files[i].size;
-                memset(send_buf, 0, FILE_SEND_BUF_SIZE);
-                while (remain > 0) {
-                    size_t chunk = (remain > FILE_SEND_BUF_SIZE) ?
-                                   FILE_SEND_BUF_SIZE : (size_t)remain;
-                    if (send_all(client_sock, send_buf, chunk) != 0) break;
-                    remain -= chunk;
-                }
-                continue;
-            }
-
-            /* 修复[BUG-2]: remain 用 uint64_t，避免32位截断 */
-            uint64_t remain = files[i].size;
-            while (remain > 0) {
-                size_t chunk = (remain > FILE_SEND_BUF_SIZE) ?
-                               FILE_SEND_BUF_SIZE : (size_t)remain;
-                size_t n = fread(send_buf, 1, chunk, fp);
-                if (n == 0) {
-                    printf("[TRANSFER] fread EOF early: %s\n", files[i].name);
-                    break;
-                }
-                /* 修复[BUG-5]: 用 send_all 保证全部发出 */
-                if (send_all(client_sock, send_buf, n) != 0) {
-                    printf("[TRANSFER] send failed mid-file: %s\n", files[i].name);
-                    fclose(fp);
-                    free(send_buf);
-                    goto task_exit;
-                }
-                remain -= n;
-            }
-            fclose(fp);
-            printf("[TRANSFER] Sent: %s (%llu bytes)\n",
-                   files[i].name, (unsigned long long)files[i].size);
+        /* 等待主端收到ACK后主动关闭连接，不能从端抢先close。
+         * 若从端先close，主端recv(ack)拿到连接断开(n=0)而非ACK字符串。
+         * 这里用recv等主端关闭（返回0），超时由SO_RCVTIMEO保护。*/
+        {
+            char drain[16];
+            int n = recv(sock, drain, sizeof(drain), 0);
+            ESP_LOGI(TAG, "Master closed connection (n=%d), all done", n);
         }
-        free(send_buf);
+        success = true;
     }
 
-    /* --------------------------------------------------------
-     * 步骤6: 发送 DONE，等从机最终ACK
-     * -------------------------------------------------------- */
-    {
-        const char *done = "DONE";
-        send_all(client_sock, done, strlen(done));  /* 尽力发，不判断返回值 */
-
-        char ack[16] = {0};
-        recv(client_sock, ack, sizeof(ack) - 1, 0);    /* 有超时保护，不会死等 */
-        printf("[TRANSFER] Transfer complete, slave ack: '%s'\n", ack);
-    }
-
-    close(client_sock); client_sock = -1;
-    close(listen_sock); listen_sock = -1;
-
-    /* --------------------------------------------------------
-     * 步骤7: 删除SD卡所有文件，并同步文件系统
-     * 修复[LOGIC-4]: 原代码删完没有 sync，切回USB后PC可能看到残留缓存
-     * -------------------------------------------------------- */
-    printf("[TRANSFER] Deleting all files on SD...\n");
-    {
-        DIR *dir = opendir(SD_MOUNT_POINT);
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (entry->d_type == DT_REG) {
-                    char path[300];
-                    snprintf(path, sizeof(path), "%s/%s",
-                             SD_MOUNT_POINT, entry->d_name);
-                    if (unlink(path) == 0) {
-                        printf("[TRANSFER] Deleted: %s\n", entry->d_name);
-                    } else {
-                        printf("[TRANSFER] Delete failed: %s\n", entry->d_name);
-                    }
-                }
-            }
-            closedir(dir);
-        }
-        /* ESP-IDF 的 FatFS 中 unlink() 是同步操作，目录项立即更新，
-         * 无需额外 sync()（ESP-IDF newlib 未提供该符号）。
-         * 延迟一小段时间确保底层写操作完成后再切换总线。 */
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-
-/* --------------------------------------------------------
- * 统一出口：关闭socket，切回USB，释放资源
- * -------------------------------------------------------- */
-task_exit:
-    if (client_sock >= 0) { close(client_sock); }
-    if (listen_sock >= 0) { close(listen_sock); }
-    if (files)            { free(files); }
-
-    /* 只有成功进入WiFi模式的情况下才需要切回USB
-     * 修复[BUG-1]: 原代码无论是否切换成功都会调用 switch_to_usb_mode */
-    if (entered_wifi_mode) {
-        printf("[TRANSFER] Switching back to USB mode...\n");
-        switch_to_usb_mode();
-    }
-
-    /* 修复[LOGIC-2]: 传输任务结束后重置 g_sta_count。
-     * 从机发完文件后通常会继续保持WiFi连接（g_sta_count 不会自动归零），
-     * 若不重置，主循环下次检测到 g_sta_count>0 会再次触发传输（但SD已无文件，
-     * 会白白切换一次USB模式）。重置后等从机真正断开再重连才会触发。
-     *
-     * 注意: 若存在多个从机同时在线，此处全量清零是合理的——
-     *       因为本次任务已经广播了所有文件，无需对同一批文件再次传输。 */
-    g_sta_count = 0;
-
-    g_transfer_busy = false;
-    printf("[TRANSFER] Task done\n");
-    vTaskDelete(NULL);
+recv_exit:
+    if (fp)       { fclose(fp); }
+    if (recv_buf) { free(recv_buf); }
+    return success;
 }
 
 /* ======================== 主函数 ======================== */
@@ -585,67 +412,189 @@ void app_main(void)
     /* LED初始化 */
     led_init();
     LED(1);
-    vTaskDelay(pdMS_TO_TICKS(6000));    /* 等待USB枚举完成 */
+    vTaskDelay(pdMS_TO_TICKS(6000));    /* 等待USB枚举完成（与主端保持一致） */
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("\n========== MASTER V3.0 (Auto Transfer) ==========\n");
+    printf("\n========== SLAVE V2.0 (Auto Receive) ==========\n");
 
-    /* SD卡初始化 */
+    /* ---------- SD卡 + USB MSC 初始化 ----------
+     * 默认以USB U盘模式启动，PC可直接访问SD卡。
+     * 接收文件时再切换到本地模式，接收完毕后切回。 */
     sdmmc_card_t *sd_card = NULL;
     esp_err_t sd_ret = sd_card_init(&sd_card);
-    bool sd_ok = (sd_ret == ESP_OK && sd_card != NULL);
+    g_sd_ok = (sd_ret == ESP_OK && sd_card != NULL);
 
-    if (sd_ok) {
+    if (g_sd_ok) {
         printf("[MAIN] SD card OK\n");
 #if USE_USB_MSC
+        /* 注意: 只调用 usb_msc_init()，不调用 usb_msc_mount()。
+         *
+         * usb_msc_init() 完成:
+         *   - 注册 SDMMC 到 TinyUSB MSC 存储层
+         *   - 安装 TinyUSB 驱动，USB PHY 使能，PC 可识别 U 盘
+         *   此时 SD 卡由 TinyUSB/PC 控制，ESP32 本地不可读写，这是正确的待机状态。
+         *
+         * usb_msc_mount() 的作用是把 SD 卡挂载给 ESP32 本地 FATFS 用，
+         * 那是"WiFi本地模式"下才需要做的事（switch_to_wifi_mode 里会调用
+         * tinyusb_msc_storage_mount），现在不能提前挂载，否则和 TinyUSB 冲突。*/
         printf("[MAIN] Init USB MSC...\n");
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
-        ESP_ERROR_CHECK(usb_msc_mount(SD_MOUNT_POINT));
-        printf("[MAIN] USB MSC ready, PC can copy files\n");
+        /* 不在这里 mount，保持 USB 模式让 PC 访问 */
+        printf("[MAIN] USB MSC ready, PC can access SD\n");
 #endif
     } else {
-        printf("[MAIN] SD card FAILED: %s (0x%x)\n",
-               esp_err_to_name(sd_ret), sd_ret);
+        printf("[MAIN] SD card FAILED: %s\n", esp_err_to_name(sd_ret));
     }
 
-    /* WiFi AP初始化 */
-    printf("[MAIN] Starting WiFi AP...\n");
-    wifi_init_softap();
-    printf("[MAIN] AP active: %s\n", WIFI_SSID);
+    /* ---------- WiFi STA 初始化 ----------
+     * 注意: 主端可能还没开机，热点不存在是正常的。
+     * 连接失败不重启，进主循环后持续等待热点出现。
+     * WiFi驱动会在后台自动重连（事件回调里有重试逻辑）。 */
+    printf("[MAIN] Starting WiFi STA (master may not be on yet)...\n");
+    wifi_init_sta();   /* 无论成功失败都继续，g_wifi_connected标志后续判断 */
 
-    /* 主循环 */
-    int loop_cnt = 0;
     LED(0);
-    printf("[MAIN] Entering main loop, waiting for slave...\n");
+    printf("[MAIN] Ready (USB mode). Waiting for master WiFi...\n");
+
+    /* ======================== 主循环 ========================
+     * 正常待机：USB U盘模式，PC可访问SD。
+     * 轮询TCP连接主端：
+     *   连上 → 切WiFi本地模式 → 接收文件 → 切回USB模式
+     *   未连上 → 等待后继续轮询（主端SD无文件时不开Server，属正常）
+     * ======================================================== */
+    int loop_cnt = 0;
 
     while (1) {
         LED_TOGGLE();
 
-        /* 触发条件：SD正常 + 当前无传输任务 + 有从机在线
-         *
-         * 修复[BUG-3]: 先置 g_transfer_busy=true 再 xTaskCreate，
-         * 防止 xTaskCreate 返回后、新任务调度前的200ms tick里再次触发。
-         * 注意: g_transfer_busy 是 volatile，两条语句之间无竞态（单核调度）。 */
-        if (sd_ok && !g_transfer_busy && g_sta_count > 0) {
-            printf("[MAIN] Slave detected (STA=%d), starting transfer task\n",
-                   g_sta_count);
-            g_transfer_busy = true;     /* 先置位！修复[BUG-3] */
-            BaseType_t rc = xTaskCreate(file_transfer_task, "transfer",
-                                        8192,   /* 栈8KB，文件列表已改堆分配 */
-                                        NULL, 5, NULL);
-            if (rc != pdPASS) {
-                printf("[MAIN] xTaskCreate failed!\n");
-                g_transfer_busy = false;    /* 创建失败则复位 */
+        /* WiFi未连接：等待主端热点出现，驱动后台自动重连 */
+        if (!g_wifi_connected) {
+            if (++loop_cnt >= 10) {
+                loop_cnt = 0;
+                printf("[LOOP] Waiting for master WiFi (%s)...\n", MASTER_SSID);
+                /* 重试次数耗尽后驱动停止自动重连，手动踢一下 */
+                s_retry_num = 0;
+                esp_wifi_connect();
             }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        loop_cnt = 0;
+        printf("[LOOP] WiFi OK, polling master TCP...\n");
+
+        if (!g_sd_ok) {
+            printf("[LOOP] SD not available\n");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
         }
 
-        if (++loop_cnt >= 25) {
-            loop_cnt = 0;
-            printf("[LOOP] Mode:%s  STA:%d  Transfer:%s\n",
-                   g_wifi_mode      ? "WiFi" : "USB",
-                   g_sta_count,
-                   g_transfer_busy  ? "running" : "idle");
+        /* ---------- 尝试TCP连接主端 ----------
+         * 此时仍处于USB模式，connect() 只是建立网络连接，不涉及SD操作，安全。
+         * 只有连接成功后才切换模式。 */
+        int  sock      = -1;
+        bool connected = false;
+
+        for (int attempt = 0; attempt < TCP_CONNECT_RETRY; attempt++) {
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                printf("[TCP] socket() failed\n");
+                break;
+            }
+
+            struct timeval tv = { .tv_sec = TCP_RECV_TIMEOUT_S, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            struct sockaddr_in master_addr = {0};
+            master_addr.sin_family = AF_INET;
+            master_addr.sin_port   = htons(MASTER_PORT);
+            inet_pton(AF_INET, MASTER_IP, &master_addr.sin_addr);
+
+            if (connect(sock, (struct sockaddr *)&master_addr,
+                        sizeof(master_addr)) == 0) {
+                connected = true;
+                printf("[TCP] Connected to master (attempt %d)\n", attempt + 1);
+                break;
+            }
+
+            printf("[TCP] Connect failed (%d/%d), retry in %dms\n",
+                   attempt + 1, TCP_CONNECT_RETRY, TCP_CONNECT_RETRY_MS);
+            close(sock);
+            sock = -1;
+            vTaskDelay(pdMS_TO_TICKS(TCP_CONNECT_RETRY_MS));
         }
 
-        vTaskDelay(sd_ok ? pdMS_TO_TICKS(200) : pdMS_TO_TICKS(500));
+        if (!connected) {
+            /* 主端SD无文件时不开Server，TCP连接失败是正常情况。
+             * 等待10秒再轮询，避免频繁切换USB模式骚扰PC。 */
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        /* ---------- TCP已连上，先做握手验证再切模式 ----------
+         * 关键: 不能TCP一连上就切WiFi模式断USB。
+         * 必须先收到主端发来的 "MASTER_SEND" 确认对方身份，
+         * 握手失败说明连的不是主端（或主端状态不对），直接断开，USB不动。 */
+        {
+            /* 握手超时独立设短一点（5秒），不影响后续传输超时 */
+            struct timeval htv = { .tv_sec = 5, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &htv, sizeof(htv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &htv, sizeof(htv));
+
+            char greeting[16] = {0};
+            int  n = recv(sock, greeting, 11, MSG_WAITALL);
+            if (n != 11 || strncmp(greeting, "MASTER_SEND", 11) != 0) {
+                printf("[TCP] Handshake failed (n=%d, data='%.*s'), drop\n",
+                       n, (n > 0 ? n : 0), greeting);
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                continue;   /* 回主循环，不切模式 */
+            }
+            printf("[TCP] Handshake OK, master confirmed\n");
+
+            /* 握手通过，现在才切WiFi本地模式断USB */
+            printf("[TRANSFER] Switching to WiFi mode...\n");
+            if (!switch_to_wifi_mode()) {
+                printf("[TRANSFER] Mode switch failed, abort\n");
+                /* 已收到MASTER_SEND但没回READY，主端会超时退出，没关系 */
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            /* 切换成功后恢复传输超时，回复READY */
+            struct timeval ttv = { .tv_sec = TCP_RECV_TIMEOUT_S, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ttv, sizeof(ttv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ttv, sizeof(ttv));
+
+            if (send(sock, "READY", 5, 0) != 5) {
+                printf("[TRANSFER] Send READY failed\n");
+                close(sock);
+                switch_to_usb_mode();
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+            printf("[TRANSFER] Sent READY, starting receive...\n");
+        }
+
+        /* ---------- 执行文件接收（握手已在上面完成，跳过内部握手）---------- */
+        LED(1);
+        bool ok = do_file_receive_after_handshake(sock);
+        close(sock);
+        LED(0);
+
+        if (ok) {
+            printf("[TRANSFER] All files received OK\n");
+        } else {
+            printf("[TRANSFER] Receive failed or incomplete\n");
+        }
+
+        /* ---------- 切回USB模式 ----------
+         * 无论接收成功与否都要切回，保证PC能正常访问SD。 */
+        printf("[TRANSFER] Switching back to USB mode...\n");
+        switch_to_usb_mode();
+
+        /* 等待主端完成删文件+切USB操作后再进入下一轮。
+         * 主端删完文件约需300ms+切USB约需300ms，留5秒余量。 */
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
