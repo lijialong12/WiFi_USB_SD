@@ -450,13 +450,11 @@ void app_main(void)
     while (1) {                              /* 无限循环 */
         LED_TOGGLE();                        /* 翻转LED状态，指示心跳 */
 
-        /* WiFi未连接：等待主端热点出现，驱动后台自动重连 */
+        /* WiFi未连接：等待主端热点出现，降低重试频率避免影响USB */
         if (!g_wifi_connected) {             /* 如果WiFi未连接 */
-            if (++loop_cnt >= 10) {          /* 每10次循环打印一次信息 */
+            if (++loop_cnt >= 5) {           /* 每5次循环（10秒）打印一次信息并尝试连接 */
                 loop_cnt = 0;                /* 重置计数器 */
                 printf("[循环] 等待主机WiFi (%s)...\n", MASTER_SSID); /* 打印等待信息 */
-                /* 重试次数耗尽后驱动停止自动重连，手动踢一下 */
-                s_retry_num = 0;             /* 重置重试计数 */
                 esp_wifi_connect();          /* 手动触发连接 */
             }
             vTaskDelay(pdMS_TO_TICKS(2000)); /* 延迟2秒继续循环 */
