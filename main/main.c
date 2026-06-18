@@ -571,21 +571,12 @@ void app_main(void)
         }
 
         /* ---------- 切回USB模式 ----------
-         * 无论接收成功与否都要切回，保证PC能正常访问SD。 */
+         * 无论接收成功与否都要切回，保证PC能正常访问SD。
+         * 保持WiFi不断开（不断开重连），避免WiFi扫描影响USB */
         printf("[传输] 切换回USB模式...\n"); /* 打印切换提示 */
         switch_to_usb_mode();                /* 切换回USB U盘模式 */
 
-        /* ---------- 断开并重连WiFi ----------
-         * 主动断开再重连，让主端检测到新STA连接，触发新一轮传输。
-         * 否则主端看到g_sta_count不变，不会再次启动传输任务。 */
-        printf("[传输] 重连WiFi以触发下一轮传输...\n"); /* 打印提示 */
-        esp_wifi_disconnect();               /* 断开WiFi */
-        s_retry_num = 0;                     /* 重置重试计数 */
-        esp_wifi_connect();                  /* 重新连接 */
-        g_wifi_connected = false;            /* 重置连接状态，等待重连成功 */
-        printf("[传输] WiFi重连中...\n");     /* 打印提示 */
-
-        /* 等待WiFi重连完成+主端处理文件后再进入下一轮 */
+        /* 等待主端完成删文件+切USB操作后再进入下一轮 */
         vTaskDelay(pdMS_TO_TICKS(5000));     /* 等待5秒 */
     }
 }
