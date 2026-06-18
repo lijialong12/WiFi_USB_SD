@@ -427,7 +427,7 @@ void app_main(void)
 #if USE_USB_MSC
         printf("[主函数] 初始化 USB MSC...\n"); /* 打印USB MSC初始化提示 */
         ESP_ERROR_CHECK(usb_msc_init(sd_card)); /* 初始化USB MSC，注册SD卡给TinyUSB */
-        /* 不在这里 mount，保持 USB 模式让 PC 访问 */
+        tud_connect();                       /* 连接USB，让PC能识别U盘 */
         printf("[主函数] USB MSC 就绪，PC可访问SD卡\n"); /* 打印就绪信息 */
 #endif
     } else {                                 /* SD卡初始化失败 */
@@ -582,8 +582,17 @@ void app_main(void)
         printf("[传输] 切换回USB模式...\n"); /* 打印切换提示 */
         switch_to_usb_mode();                /* 切换回USB U盘模式 */
 
-        /* 等待主端完成删文件+切USB操作后再进入下一轮。
-         * 主端删完文件约需300ms+切USB约需300ms，留5秒余量。 */
+        /* ---------- 断开并重连WiFi ----------
+         * 主动断开再重连，让主端检测到新STA连接，触发新一轮传输。
+         * 否则主端看到g_sta_count不变，不会再次启动传输任务。 */
+        printf("[传输] 重连WiFi以触发下一轮传输...\n"); /* 打印提示 */
+        esp_wifi_disconnect();               /* 断开WiFi */
+        s_retry_num = 0;                     /* 重置重试计数 */
+        esp_wifi_connect();                  /* 重新连接 */
+        g_wifi_connected = false;            /* 重置连接状态，等待重连成功 */
+        printf("[传输] WiFi重连中...\n");     /* 打印提示 */
+
+        /* 等待WiFi重连完成+主端处理文件后再进入下一轮 */
         vTaskDelay(pdMS_TO_TICKS(5000));     /* 等待5秒 */
     }
 }
