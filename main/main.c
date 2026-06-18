@@ -181,14 +181,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) { /* STA断开连接 */
         g_wifi_connected = false;            /* 更新连接状态为假 */
-        if (s_retry_num < WIFI_MAX_RETRY) {  /* 如果重试次数未达上限 */
-            esp_wifi_connect();              /* 再次尝试连接 */
-            s_retry_num++;                   /* 重试计数加1 */
-            ESP_LOGI(TAG, "重试连接WiFi (%d/%d)...", s_retry_num, WIFI_MAX_RETRY); /* 打印重试信息 */
-        } else {                             /* 已达最大重试次数 */
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT); /* 设置失败事件位 */
-            ESP_LOGE(TAG, "WiFi连接失败，已重试%d次", WIFI_MAX_RETRY); /* 打印错误信息 */
-        }
+        ESP_LOGI(TAG, "WiFi已断开");          /* 打印断开信息 */
+        /* 不在事件回调中立即重试，避免频繁扫描影响USB
+         * 重试逻辑移到主循环中，降低重试频率 */
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) { /* STA获取到IP地址 */
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data; /* 获取事件数据 */
