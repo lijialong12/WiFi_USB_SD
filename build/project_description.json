@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "03_WiFi_AP",
-    "project_version":    "094476f-dirty",
+    "project_version":    "2d1766e-dirty",
     "project_path":       "D:/Fork/WiFi_USB_SD",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.4.1",
     "build_dir":          "D:/Fork/WiFi_USB_SD/build",
