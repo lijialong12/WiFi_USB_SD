@@ -6,19 +6,10 @@
  * @date        2026-06-22
  * @brief       主端程序 - USB MSC + GPIO0按键触发 + WiFi AP按需开启
  *
- *              核心设计:
- *               - 常态为纯 USB U盘，WiFi热点关闭
- *               - PC拷贝文件完成后，用户按下 GPIO0 按键
- *               - 主机短暂断开USB，检查SD卡中是否有文件
- *               - 若有文件，启动WiFi热点，等待从机连接传输
- *               - 传输完成后等待从机ACK，删除文件，关闭热点，恢复USB
- *               - 若无文件，直接恢复USB，不开启热点
- *
- *              关键修复(V3.5):
- *               - 初始化时不调用 usb_msc_mount（TinyUSB MSC管理SD）
- *               - WiFi启停复用初始化，避免重复创建netif
- *
- * @license     重庆博士康科技有限公司版权所有
+ *              【V3.5 修复记录】
+ *               - 修复因 TCP 10秒超时过短导致大文件传输失败、从机产生空文件的问题
+ *               - 宏定义 TRANSFER_ACK_TIMEOUT 从 10 提升至 60 秒
+ *               - 完善 fread 读取失败的报错处理逻辑
  ****************************************************************************************************
  */
 
@@ -61,7 +52,8 @@ static const char *TAG = "MASTER";
 
 #define TRANSFER_PORT           3333
 #define ACCEPT_TIMEOUT_S        60      /* 等待从机连接超时(秒) */
-#define TRANSFER_ACK_TIMEOUT    10
+/* 🔴【重要修改】超时时间从 10 秒加大到 60 秒，防止大文件传输中断 */
+#define TRANSFER_ACK_TIMEOUT    60
 #define SD_MOUNT_POINT          "/sd"
 #define MAX_FILES               100
 #define FILE_SEND_BUF_SIZE      4096
@@ -82,7 +74,6 @@ static void IRAM_ATTR button_isr_handler(void *arg);
 
 typedef struct { char name[256]; uint64_t size; } file_info_t;
 
-/* ======================== 安全发送 ======================== */
 static int send_all(int sock, const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -94,7 +85,6 @@ static int send_all(int sock, const void *buf, size_t len)
     return 0;
 }
 
-/* ======================== 模式切换 ======================== */
 static bool switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
@@ -133,7 +123,6 @@ static void switch_to_usb_mode(void)
 #endif
 }
 
-/* ======================== 按键 ======================== */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
     g_button_pressed = true;
@@ -153,7 +142,6 @@ static void button_init(void)
     gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
 }
 
-/* ======================== WiFi AP (按需启停) ======================== */
 static bool g_wifi_init_once = false;
 
 static void wifi_init_once(void)
@@ -210,7 +198,6 @@ static void wifi_ap_stop(void)
     printf("[WiFi] AP已停止\n");
 }
 
-/* ======================== 传输处理 ======================== */
 static void handle_transfer(int client_sock)
 {
     file_info_t *files = NULL;
@@ -229,7 +216,7 @@ static void handle_transfer(int client_sock)
         if (!has_file) { printf("[传输] SD无文件\n"); return; }
     }
 
-    /* 2. 超时 */
+    /* 2. 设置超时 */
     struct timeval tv = { .tv_sec = TRANSFER_ACK_TIMEOUT, .tv_usec = 0 };
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -298,8 +285,18 @@ static void handle_transfer(int client_sock)
         while (remain > 0) {
             size_t c = (remain > FILE_SEND_BUF_SIZE) ? FILE_SEND_BUF_SIZE : (size_t)remain;
             size_t n = fread(send_buf, 1, c, fp);
-            if (n == 0) break;
-            if (send_all(client_sock, send_buf, n) != 0) { fclose(fp); goto cleanup; }
+            
+            // 🔴【重要修改】读取到 0 字节时认为是错误，立刻终止，防止发送空文件
+            if (n == 0) { 
+                fclose(fp); 
+                printf("[传输] 本地读取文件 %s 失败\n", files[i].name);
+                goto cleanup; 
+            }
+            
+            if (send_all(client_sock, send_buf, n) != 0) { 
+                fclose(fp); 
+                goto cleanup; 
+            }
             remain -= n;
         }
         fclose(fp);
@@ -340,7 +337,6 @@ cleanup:
     printf("[传输] 完成\n");
 }
 
-/* ======================== 主函数 ======================== */
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -359,7 +355,6 @@ void app_main(void)
         printf("[主函数] SD卡就绪\n");
 #if USE_USB_MSC
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
-        /* V3.5修复: 不调用 usb_msc_mount，由TinyUSB MSC直接管理SD */
         tud_connect();
         vTaskDelay(pdMS_TO_TICKS(1000));
         printf("[主函数] USB MSC 就绪，PC可访问SD卡\n");
@@ -387,14 +382,12 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
             printf("[按键] 用户按下，检查SD卡...\n");
 
-            /* 1. 断USB，本地挂载SD */
             if (!switch_to_wifi_mode()) {
                 printf("[按键] 切模式失败\n");
                 switch_to_usb_mode();
                 continue;
             }
 
-            /* 2. 检查文件 */
             bool has_file = false;
             DIR *dir = opendir(SD_MOUNT_POINT);
             if (dir) {
@@ -410,11 +403,9 @@ void app_main(void)
                 continue;
             }
 
-            /* 3. 有文件，开WiFi */
             printf("[按键] 发现文件，启动WiFi热点...\n");
             wifi_ap_start();
 
-            /* 4. 创建TCP监听 */
             int lsock = socket(AF_INET, SOCK_STREAM, 0);
             if (lsock < 0) { wifi_ap_stop(); switch_to_usb_mode(); continue; }
 
