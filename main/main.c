@@ -143,26 +143,34 @@ static void button_init(void)
 }
 
 static bool g_wifi_init_once = false;
+static esp_netif_t *g_ap_netif = NULL; // 明确保存句柄，防止重复创建
 
 static void wifi_init_once(void)
 {
     if (g_wifi_init_once) return;
-    esp_netif_init();
-    esp_event_loop_create_default();
+    
+    // 全局基础网络环境，一生只需初始化一次
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // 创建默认 AP 接口，一生也只需创建一次
+    g_ap_netif = esp_netif_create_default_wifi_ap();
+    
     g_wifi_init_once = true;
 }
 
 static void wifi_ap_start(void)
 {
-    esp_wifi_stop();
-    esp_wifi_deinit();
-
+    // 确保基础环境就绪
     wifi_init_once();
-    esp_netif_create_default_wifi_ap();
 
+    // 🔴【核心修复】彻底删除了开头的 esp_wifi_stop() 和 esp_wifi_deinit()
+
+    // 1. 初始化 Wi-Fi 驱动层
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    // 2. 获取 NVS 中的 Wi-Fi 配置
     char ssid[32] = WIFI_SSID;
     char pass[64] = WIFI_PASS;
     nvs_handle_t nvs;
@@ -174,9 +182,13 @@ static void wifi_ap_start(void)
         nvs_close(nvs);
     }
 
+    // 3. 配置并启动 AP
     wifi_config_t wifi_cfg = {
-        .ap = { .ssid_len = strlen(ssid), .max_connection = MAX_STA_CONN,
-                .authmode = WIFI_AUTH_WPA_WPA2_PSK },
+        .ap = { 
+            .ssid_len = strlen(ssid), 
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK 
+        },
     };
     memcpy(wifi_cfg.ap.ssid, ssid, sizeof(wifi_cfg.ap.ssid));
     memcpy(wifi_cfg.ap.password, pass, sizeof(wifi_cfg.ap.password));
@@ -186,16 +198,21 @@ static void wifi_ap_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // 4. 获取并打印 IP，确认网络就绪
     esp_netif_ip_info_t ip;
-    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip);
-    printf("[WiFi] AP已启动: SSID=%s, IP=" IPSTR "\n", ssid, IP2STR(&ip.ip));
+    if (g_ap_netif) {
+        esp_netif_get_ip_info(g_ap_netif, &ip);
+        printf("[WiFi] AP已启动: SSID=%s, IP=" IPSTR "\n", ssid, IP2STR(&ip.ip));
+    }
 }
 
 static void wifi_ap_stop(void)
 {
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    printf("[WiFi] AP已停止\n");
+    // 仅仅关闭和反初始化驱动层，不触动全局 netif
+    if (esp_wifi_stop() == ESP_OK) {
+        esp_wifi_deinit();
+        printf("[WiFi] AP已停止\n");
+    }
 }
 
 static void handle_transfer(int client_sock)
