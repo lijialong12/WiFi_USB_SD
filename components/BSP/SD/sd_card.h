@@ -49,6 +49,5 @@
 /* ======================== 函数声明 ======================== */
 esp_err_t sd_card_init(sdmmc_card_t **out_card);    /* 初始化SD卡: SDMMC 4-bit 40MHz, 成功时*out_card指向已分配的控制块 */
 esp_err_t sd_card_deinit(sdmmc_card_t *card);       /* 反初始化SD卡: 释放卡槽/主机/内存, 参数为sd_card_init返回的指针 */
-esp_err_t sd_card_mount_fatfs(sdmmc_card_t *card, const char *base_path, int max_files); /* 直接挂载FATFS(不经过USB MSC), 挂载后可fopen访问 */
 
 #endif                                           /* __SD_CARD_H 头文件保护结束 */

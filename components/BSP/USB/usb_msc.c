@@ -31,7 +31,6 @@
 
 static const char *TAG = "USB_MSC";         /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 
-static bool g_msc_initialized = false;      /* USB MSC初始化状态标志: true=已初始化, false=未初始化 */
 
 
 /* ========================================================================== */
@@ -168,60 +167,11 @@ esp_err_t usb_msc_init(sdmmc_card_t *card)
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));                  /* 安装TinyUSB驱动: 注册到USB OTG硬件, 拉高D+通知主机 */
 
-    g_msc_initialized = true;                                            /* 标记MSC已初始化(供mount/unmount检查状态) */
+
     printf("[USB_MSC] Init done! Connect USB OTG cable (GPIO19=D-, GPIO20=D+) to PC.\n"); /* 提示用户可以连接USB线 */
     ESP_LOGI(TAG, "USB MSC initialization done - waiting for USB host connection..."); /* 记录成功日志 */
     return ESP_OK;                                                       /* 返回成功 */
 }
 
-/**
- * @brief       挂载FATFS文件系统, 供ESP32本地访问SD卡文件
- *              调用后ESP32可通过fopen/fread/fwrite等标准C文件API操作SD卡
- *              注意: 挂载期间PC通过USB MSC访问SD卡会造成文件系统冲突
- *              解决方案: PC访问前先调用usb_msc_unmount()卸载
- * @param       base_path: FATFS挂载点路径, 如"/sd" (必须以"/"开头)
- * @retval      ESP_OK: 挂载成功, ESP32可读写SD卡文件
- * @retval      ESP_ERR_INVALID_STATE: USB MSC尚未初始化, 无法挂载
- * @retval      其他: FATFS挂载失败(由ESP_ERROR_CHECK捕获)
- */
-esp_err_t usb_msc_mount(const char *base_path)
-{
-    if (!g_msc_initialized)                                              /* 检查MSC是否已初始化 */
-    {
-        ESP_LOGE(TAG, "USB MSC not initialized, cannot mount");          /* 记录错误: 未初始化 */
-        return ESP_ERR_INVALID_STATE;                                    /* 返回状态无效错误码 */
-    }
-
-    ESP_LOGI(TAG, "Mounting storage at %s...", base_path);               /* 输出挂载路径 */
-    ESP_ERROR_CHECK(tinyusb_msc_storage_mount(base_path));               /* 调用TinyUSB MSC挂载函数: 内部调用f_mount() */
-    ESP_LOGI(TAG, "Storage mounted at %s", base_path);                   /* 挂载成功 */
-
-    return ESP_OK;                                                       /* 返回成功 */
-}
 
 
-
-/**
- * @brief       卸载FATFS文件系统, 将SD卡控制权交还给USB主机(PC)
- *              卸载后PC可通过USB MSC独占访问SD卡, 避免文件系统冲突
- *              使用场景: ①ESP32写完日志后卸载 → PC通过USB读取
- *                       ②PC通过USB弹出磁盘 → ESP32重新挂载继续写日志
- * @param       无
- * @retval      ESP_OK: 卸载成功, PC可安全访问SD卡
- * @retval      ESP_ERR_INVALID_STATE: USB MSC尚未初始化, 无法卸载
- * @retval      其他: FATFS卸载失败(由ESP_ERROR_CHECK捕获)
- */
-esp_err_t usb_msc_unmount(void)
-{
-    if (!g_msc_initialized)                                              /* 检查MSC是否已初始化 */
-    {
-        ESP_LOGE(TAG, "USB MSC not initialized, cannot unmount");        /* 记录错误: 未初始化 */
-        return ESP_ERR_INVALID_STATE;                                    /* 返回状态无效错误码 */
-    }
-
-    ESP_LOGI(TAG, "Unmounting storage...");                               /* 输出: 正在卸载 */
-    ESP_ERROR_CHECK(tinyusb_msc_storage_unmount());                      /* 调用TinyUSB MSC卸载函数: 内部调用f_unmount(), 刷新缓存 */
-    ESP_LOGI(TAG, "Storage unmounted, ready for USB host access");       /* 卸载成功, 提示PC可访问 */
-
-    return ESP_OK;                                                       /* 返回成功 */
-}
