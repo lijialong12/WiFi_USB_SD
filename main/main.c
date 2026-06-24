@@ -79,8 +79,6 @@
 #include <stdbool.h>   // 标准布尔类型头文件，支持 true/false
 #include "freertos/FreeRTOS.h"       // ESP-IDF 的 FreeRTOS 实时操作系统核心头文件
 #include "freertos/task.h"           // FreeRTOS 任务管理头文件，用于 vTaskDelay 等
-#include "esp_system.h"              // ESP 系统基础功能头文件
-#include "esp_log.h"                 // ESP 日志系统头文件，用于打印 ESP_LOGx
 #include "nvs_flash.h"               // 非易失性存储（NVS）头文件，保存 WiFi 配置等
 #include "nvs.h"                     // NVS 操作的具体函数
 #include "esp_wifi.h"                // ESP 的 WiFi 驱动头文件，用于开启热点等
@@ -105,7 +103,6 @@
 #endif
 
 // ======================== 日志 TAG 定义 ========================
-static const char *TAG = "MASTER"; // 定义 ESP 日志过滤的标签，终端打印时会显示 [MASTER]，方便区分主从机日志
 
 // ======================== 核心参数配置宏定义 ========================
 #define WIFI_SSID       "BOSSCOM_USB_AP" // 主端开启的热点 SSID（名字），从机必须以此名称连接
@@ -512,7 +509,7 @@ void app_main(void)
         nvs_flash_erase(); // 如果 NVS 分区损坏或版本不对，擦除重建
         nvs_flash_init();  // 重新初始化
     }
-
+    
     led_init();            // 初始化开发板上的 LED 灯引脚
     LED(1);                // 点亮 LED (短暂亮起代表 CPU 已进入运行状态)
 
