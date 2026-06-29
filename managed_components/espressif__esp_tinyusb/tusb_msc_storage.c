@@ -33,6 +33,10 @@ static const char *TAG = "tinyusb_msc_storage";
 #error "CONFIG_TINYUSB_MSC_BUFSIZE must be divisible by MSC_STORAGE_MEM_ALIGN. Adjust your configuration (MSC FIFO size) in menuconfig."
 #endif
 
+// ✅【新增】：将你在 main.c 中定义的全局变量引入到底层，用于自动化检测
+extern volatile bool g_usb_busy;
+extern bool g_usb_written;
+
 /**
  * @brief Structure representing a single write buffer for MSC operations.
  */
@@ -311,6 +315,9 @@ fail:
  */
 static void _write_func(void *param)
 {
+    // ✅【新增】：延迟任务开始往 SD 卡真实写入数据了，标记为“忙”
+    g_usb_busy = true;
+
     // Process the data in storage_buffer
     esp_err_t err = _msc_storage_write_sector(
                         s_storage_handle->storage_buffer.lba,
@@ -321,6 +328,9 @@ static void _write_func(void *param)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Write failed, error=0x%x", err);
     }
+
+    // ✅【新增】：这一扇区（Block）的数据彻底写完，标记为“空闲”
+    g_usb_busy = false;
 }
 
 esp_err_t tinyusb_msc_storage_mount(const char *base_path)
@@ -653,7 +663,14 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 // - Application fill the buffer (up to bufsize) with address contents and return number of read byte.
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
+    // ✅【新增】：电脑开始读 U 盘了，标记为“忙”
+    g_usb_busy = true;
+    
     esp_err_t err = _msc_storage_read_sector(lba, offset, bufsize, buffer);
+
+    // ✅【新增】：读完了，标记为“空闲”
+    g_usb_busy = false;
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "msc_storage_read_sector failed: 0x%x", err);
         return 0;
@@ -667,6 +684,12 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     assert(bufsize <= MSC_STORAGE_BUFFER_SIZE);
+    
+    // ✅【新增】：电脑向 U 盘发送了写数据指令。注意：只打“写入过”的标记！
+    // 因为 TinyUSB 是异步写，实际的物理写入在后面的 _write_func 里。
+    // 这里的 g_usb_busy 不能写，必须在 _write_func 的真实物理写入时再写。
+    g_usb_written = true;
+
     // Copy data to the buffer
     memcpy((void *)s_storage_handle->storage_buffer.data_buffer, buffer, bufsize);
     s_storage_handle->storage_buffer.lba = lba;
