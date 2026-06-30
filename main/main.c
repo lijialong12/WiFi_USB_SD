@@ -81,6 +81,11 @@
 #include "sys/stat.h"                // 文件状态头文件，用于获取文件属性（未用，但已习惯包含）
 #include "unistd.h"                  // POSIX 操作系统 API，用于 unlink 删除文件
 
+// ✅ [新增位置 1]：添加容量检测与修改时间戳相关的系统头文件
+#include "esp_vfs_fat.h"
+#include <utime.h>
+#include <dirent.h>
+
 // ======================== 字节序转换宏 ========================
 #ifndef be64toh
 #define be64toh(x)  __builtin_bswap64(x) // 将 64 位大端序转为主机字节序的宏，用于接收主端发来的文件大小
@@ -104,6 +109,17 @@ static const char *TAG = "SLAVE";   // 定义串口日志的过滤标签，终�
 #define SD_MOUNT_POINT          "/sd"            // SD 卡在 ESP32 内部文件系统中的挂载路径
 #define FILE_RECV_BUF_SIZE      4096             // 接收文件数据的缓冲区大小（4KB，与主端匹配）
 
+// ✅ [新增位置 2]：添加容量滑动清理阈值与 NVS 降频写入配置宏
+// #define STORAGE_TRIGGER_PERCENT 90  // SD卡使用率达到 90% 时触发清理
+// #define STORAGE_STOP_PERCENT    85  // 清理到使用率 85% 时停止
+// #define MAX_FILES               100 // 单次扫描清理最多处理 100 个文件（防内存溢出）
+// #define NVS_COMMIT_INTERVAL     3  // 序列号每累积 20 个文件，才写入一次 NVS（降频，防止过劳）
+
+#define STORAGE_TRIGGER_PERCENT 50  // SD卡使用率达到 90% 时触发清理
+#define STORAGE_STOP_PERCENT    20  // 清理到使用率 85% 时停止
+#define MAX_FILES               100 // 单次扫描清理最多处理 100 个文件（防内存溢出）
+#define NVS_COMMIT_INTERVAL     1  // 序列号每累积 20 个文件，才写入一次 NVS（降频，防止过劳）
+
 // ======================== 事件组位标志定义 ========================
 #define WIFI_GOT_IP_BIT         BIT0  // 事件组第 0 位：表示 WiFi 已成功连接并获取到了 IP 地址
 #define WIFI_DISCONNECTED_BIT   BIT1  // 事件组第 1 位：表示 WiFi 连接已断开
@@ -113,6 +129,10 @@ static bool               g_sd_ok          = false; // 全局标志：SD 卡是�
 static bool               g_wifi_mode      = false; // 全局标志：当前是否处于 WiFi 文件传输模式（true：USB已拔出，正在写文件）
 static bool               g_wifi_init_done = false; // 全局标志：WiFi 底层网络环境是否已初始化一次
 static EventGroupHandle_t g_wifi_eg        = NULL;  // 用于 WiFi 事件同步的 FreeRTOS 事件组句柄
+
+// ✅ [新增位置 3]：添加 NVS 序列号缓存变量（防掉电用）
+static uint64_t s_cached_seq = 0;       // 内存中缓存的序列号
+static int s_write_counter = 0;         // 计数器，记录内存中已自增了多少次
 
 // ======================== 本地函数声明 ========================
 static void  switch_to_wifi_mode(void);            // 从 USB 切换为 WiFi 接收模式（拔出 USB，挂载 SD）
@@ -186,13 +206,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         if (event_id == WIFI_EVENT_STA_START) {              // WiFi 驱动启动完成
             esp_wifi_connect();                             // 触发一次连接（不用等待结果，非阻塞）
         } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) { // WiFi 连接断开
-            xEventGroupClearBits(g_wifi_eg, WIFI_GOT_IP_BIT); // 清除“已获IP”标志位
-            xEventGroupSetBits(g_wifi_eg, WIFI_DISCONNECTED_BIT); // 设置“连接断开”标志位，通知主循环
+            xEventGroupClearBits(g_wifi_eg, WIFI_GOT_IP_BIT); // 清除"已获IP"标志位
+            xEventGroupSetBits(g_wifi_eg, WIFI_DISCONNECTED_BIT); // 设置"连接断开"标志位，通知主循环
         }
     } else if (event_base == IP_EVENT) {                    // 如果是 IP 地址相关事件
         if (event_id == IP_EVENT_STA_GOT_IP) {               // 成功从路由器（主端 AP）获取到了 IP 地址
-            xEventGroupClearBits(g_wifi_eg, WIFI_DISCONNECTED_BIT); // 清除“连接断开”标志位
-            xEventGroupSetBits(g_wifi_eg, WIFI_GOT_IP_BIT);       // 设置“已获IP”标志位，通知主循环
+            xEventGroupClearBits(g_wifi_eg, WIFI_DISCONNECTED_BIT); // 清除"连接断开"标志位
+            xEventGroupSetBits(g_wifi_eg, WIFI_GOT_IP_BIT);       // 设置"已获IP"标志位，通知主循环
         }
     }
 }
@@ -239,7 +259,7 @@ static void wifi_init_sta(void)
  */
 static bool wifi_try_connect(void)
 {
-    // 清除旧的标志位（包括“已获IP”和“断开”位），准备进行新一轮的连接
+    // 清除旧的标志位（包括"已获IP"和"断开"位），准备进行新一轮的连接
     xEventGroupClearBits(g_wifi_eg, WIFI_GOT_IP_BIT | WIFI_DISCONNECTED_BIT);
     esp_wifi_connect(); // 触发 WiFi 连接（非阻塞，结果靠事件组通知）
 
@@ -270,12 +290,12 @@ static void switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
     if (g_wifi_mode) return;                             // 如果已经在 WiFi 模式下，直接跳过
-    printf("[模式] 握手成功，拔出USB，挂载SD到FatFS...\n");
+    ESP_LOGI(TAG, "握手成功，拔出USB，挂载SD到FatFS...");
 
     /* 🔴【灯语逻辑】：拔掉USB，快闪5次提示操作 */
     LED_BLINK(5, 100);
 
-    tud_disconnect();                                    // 物理断开 USB，此时电脑会听到“U盘拔出”
+    tud_disconnect();                                    // 物理断开 USB，此时电脑会听到"U盘拔出"
     vTaskDelay(pdMS_TO_TICKS(500));                      // 等待 500ms，让 PC 彻底感知 USB 已移除
 
     tinyusb_msc_storage_unmount();                       // 从 TinyUSB 的 MSC 存储设备中卸载 SD 卡
@@ -284,13 +304,13 @@ static void switch_to_wifi_mode(void)
     // 将 SD 卡在 ESP32 内部重新挂载为普通的 FatFS 文件系统（供 fopen、fwrite 使用）
     esp_err_t ret = tinyusb_msc_storage_mount(SD_MOUNT_POINT);
     if (ret != ESP_OK) {                                 // 如果内部挂载失败
-        printf("[模式] FatFS挂载失败: %s\n", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "FatFS挂载失败: %s", esp_err_to_name(ret));
         tud_connect();                                   // 失败则重新连接 USB，防止死机
         return;
     }
 
     g_wifi_mode = true;                                  // 标记当前处于 WiFi 文件接收模式
-    printf("[模式] SD卡已挂载到FatFS，可以写文件\n");
+    ESP_LOGI(TAG, "SD卡已挂载到FatFS，可以写文件");
 #endif
 }
 
@@ -301,19 +321,19 @@ static void switch_to_usb_mode(void)
 {
 #if USE_USB_MSC
     if (!g_wifi_mode) return;                            // 如果不在 WiFi 模式下，直接跳过
-    printf("[模式] 传输完毕，把SD卡还给TinyUSB...\n");
+    ESP_LOGI(TAG, "传输完毕，把SD卡还给TinyUSB...");
 
     tinyusb_msc_storage_unmount();                       // 从内部 FatFS 文件系统中卸载 SD 卡
     vTaskDelay(pdMS_TO_TICKS(100));                      // 等待卸载完成
 
     g_wifi_mode = false;                                 // 清除 WiFi 模式标志
-    tud_connect();                                       // 物理连接 USB，电脑会听到“U盘插入”
+    tud_connect();                                       // 物理连接 USB，电脑会听到"U盘插入"
     vTaskDelay(pdMS_TO_TICKS(1500));                     // 等待 1.5 秒，让 Windows 完成驱动枚举
 
     /* 🔴【灯语逻辑】：插回USB，快闪5次提示 */
     LED_BLINK(5, 100);
 
-    printf("[模式] USB已恢复连接\n");
+    ESP_LOGI(TAG, "USB已恢复连接");
 #endif
 }
 
@@ -340,6 +360,108 @@ static int recv_all(int sock, void *buf, size_t len)
 }
 
 
+/* ======================== ✅ [新增位置 4]：添加 NVS 序列号读写函数 ======================== */
+static uint64_t get_file_sequence(void)
+{
+    nvs_handle_t nvs;
+    uint64_t seq = 1; // 默认从 1 开始
+    if (nvs_open("storage", NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u64(nvs, "file_seq", &seq);
+        nvs_close(nvs);
+    }
+    return seq;
+}
+
+static void save_file_sequence(uint64_t seq)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("storage", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u64(nvs, "file_seq", seq);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+
+/* ======================== ✅ [新增位置 5]：添加容量滑动自动清理函数 ======================== */
+static void check_and_clean_storage(void)
+{
+    uint64_t total_bytes = 0, free_bytes = 0;
+    if (esp_vfs_fat_info(SD_MOUNT_POINT, &total_bytes, &free_bytes) != ESP_OK) {
+        ESP_LOGE(TAG, "获取存储信息失败");
+        return;
+    }
+
+    if (total_bytes == 0) return;  // 防止除零
+    float used_percent = (1.0f - (float)free_bytes / (float)total_bytes) * 100.0f;
+
+    if (used_percent < STORAGE_TRIGGER_PERCENT) {
+        return; // 没到 90% 不处理
+    }
+
+    ESP_LOGW(TAG, "使用率已达 %.1f%%，准备清理最早写入的文件...", used_percent);
+
+    // 1. 收集文件
+    DIR *dir = opendir(SD_MOUNT_POINT);
+    if (!dir) return;
+
+    typedef struct {
+        char path[300];
+        time_t mtime;
+    } file_age_t;
+
+    file_age_t *files = malloc(sizeof(file_age_t) * MAX_FILES);
+    if (!files) { closedir(dir); return; }
+    int count = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && count < MAX_FILES) {
+        if (entry->d_type == DT_REG) {
+            char full_path[300];
+            snprintf(full_path, sizeof(full_path), "%s/%s", SD_MOUNT_POINT, entry->d_name);
+            struct stat st;
+            if (stat(full_path, &st) == 0) {
+                strncpy(files[count].path, full_path, 299);
+                files[count].mtime = st.st_mtime;
+                count++;
+            }
+        }
+    }
+    closedir(dir);
+    if (count <= 1) { free(files); return; }
+
+    // 2. 冒泡排序（按序列号从小到大，旧的在前）
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - i - 1; j++) {
+            if (files[j].mtime > files[j+1].mtime) {
+                file_age_t temp = files[j];
+                files[j] = files[j+1];
+                files[j+1] = temp;
+            }
+        }
+    }
+
+    // 3. 从最早的开始删除，直到降到 85%
+    int deleted_count = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t curr_total = 0, curr_free = 0;
+        if (esp_vfs_fat_info(SD_MOUNT_POINT, &curr_total, &curr_free) == ESP_OK && curr_total > 0) {
+            float curr_percent = (1.0f - (float)curr_free / (float)curr_total) * 100.0f;
+            if (curr_percent <= STORAGE_STOP_PERCENT) {
+                ESP_LOGI(TAG, "使用率已降至 %.1f%%，停止清理。", curr_percent);
+                break;
+            }
+        }
+        if (unlink(files[i].path) == 0) {
+            ESP_LOGI(TAG, "已删除旧文件: %s", files[i].path);
+            deleted_count++;
+        }
+    }
+    free(files);
+    ESP_LOGI(TAG, "清理完成，共删除 %d 个文件。", deleted_count);
+}
+
+
 /* ======================== 文件接收核心（握手后） ======================== */
 
 /**
@@ -361,17 +483,17 @@ static bool do_file_receive_after_handshake(int sock)
     {
         uint32_t count_net = 0;                          // 存放网络字节序的计数器
         if (recv_all(sock, &count_net, sizeof(count_net)) != 0) { // 接收 4 字节
-            printf("[传输] 接收文件总数失败\n");
+            ESP_LOGE(TAG, "接收文件总数失败");
             err_code = 4; goto recv_exit;               // 报错：4闪
         }
         file_count = ntohl(count_net);                  // 将网络字节序转换为主机字节序
-        printf("[传输] 期望接收 %lu 个文件\n", (unsigned long)file_count);
+        ESP_LOGI(TAG, "期望接收 %lu 个文件", (unsigned long)file_count);
         if (file_count == 0) { goto recv_exit; }        // 如果提示 0 个文件，直接正常退出
     }
 
     /* --- 2. 申请数据缓冲区 --- */
     recv_buf = (char *)malloc(FILE_RECV_BUF_SIZE);       // 在堆内存中申请 4KB 的内存空间
-    if (!recv_buf) { printf("[传输] malloc失败\n"); err_code = 4; goto recv_exit; }
+    if (!recv_buf) { ESP_LOGE(TAG, "malloc失败"); err_code = 4; goto recv_exit; }
 
     /* --- 3. 循环接收每一个文件 --- */
     for (uint32_t i = 0; i < file_count; i++) {
@@ -379,19 +501,19 @@ static bool do_file_receive_after_handshake(int sock)
         /* 接收文件名长度（2字节，大端序） */
         uint16_t name_len_net = 0;
         if (recv_all(sock, &name_len_net, sizeof(name_len_net)) != 0) {
-            printf("[传输] 接收文件名长度失败 [%lu]\n", (unsigned long)i);
+            ESP_LOGE(TAG, "接收文件名长度失败 [%lu]", (unsigned long)i);
             err_code = 5; goto recv_exit;               // 报错：5闪
         }
         uint16_t name_len = ntohs(name_len_net);         // 转主机字节序
         if (name_len == 0 || name_len > 255) {           // 文件名长度合法性校验
-            printf("[传输] 文件名长度非法=%u\n", name_len);
+            ESP_LOGE(TAG, "文件名长度非法=%u", name_len);
             err_code = 5; goto recv_exit;               // 报错：5闪
         }
 
         /* 接收文件名（变长字节） */
         char file_name[256] = {0};                       // 声明 256 字节数组存放文件名，全初始化为 0
         if (recv_all(sock, file_name, name_len) != 0) {
-            printf("[传输] 接收文件名失败\n");
+            ESP_LOGE(TAG, "接收文件名失败");
             err_code = 5; goto recv_exit;               // 报错：5闪
         }
         file_name[name_len] = '\0';                     // 手动添加字符串结束符
@@ -399,23 +521,23 @@ static bool do_file_receive_after_handshake(int sock)
         /* 接收文件大小（8字节，大端序） */
         uint64_t file_size_be = 0;
         if (recv_all(sock, &file_size_be, sizeof(file_size_be)) != 0) {
-            printf("[传输] 接收文件大小失败: %s\n", file_name);
+            ESP_LOGE(TAG, "接收文件大小失败: %s", file_name);
             err_code = 5; goto recv_exit;               // 报错：5闪
         }
         uint64_t file_size = be64toh(file_size_be);      // 转主机字节序（大端转小端）
-        printf("[传输] [%lu/%lu] %s (%llu字节)\n",
-               (unsigned long)(i+1), (unsigned long)file_count,
-               file_name, (unsigned long long)file_size);
+        ESP_LOGI(TAG, "[%lu/%lu] %s (%llu字节)",
+                 (unsigned long)(i+1), (unsigned long)file_count,
+                 file_name, (unsigned long long)file_size);
 
         /* 创建/覆盖本地目标文件 */
         char path[300];
         snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, file_name); // 拼接 SD 卡绝对路径
         unlink(path);                                     // 如果该文件存在，先删除（避免同名冲突）
 
-        fp = fopen(path, "wb");                           // 以“只写二进制”模式打开文件
+        fp = fopen(path, "wb");                           // 以"只写二进制"模式打开文件
         if (!fp) {                                       // 如果打开/创建失败（可能是 SD 卡已满）
             /* 无法创建：必须丢弃主端发过来的剩余数据，否则会导致 TCP 协议错乱 */
-            printf("[传输] 无法创建 %s，丢弃数据\n", path);
+            ESP_LOGE(TAG, "无法创建 %s，丢弃数据", path);
             uint64_t discard = file_size;
             while (discard > 0) {                         // 循环读取并直接丢弃，直到读完规定的尺寸
                 size_t chunk = (discard > FILE_RECV_BUF_SIZE) ? FILE_RECV_BUF_SIZE : (size_t)discard;
@@ -430,19 +552,38 @@ static bool do_file_receive_after_handshake(int sock)
         while (remain > 0) {
             size_t chunk = (remain > FILE_RECV_BUF_SIZE) ? FILE_RECV_BUF_SIZE : (size_t)remain;
             if (recv_all(sock, recv_buf, chunk) != 0) {   // 接收 4KB 数据到缓冲区
-                printf("[传输] 接收数据中断: %s\n", file_name);
+                ESP_LOGE(TAG, "接收数据中断: %s", file_name);
                 fclose(fp); fp = NULL;
                 err_code = 6; goto recv_exit;            // 报错：6闪
             }
             if (fwrite(recv_buf, 1, chunk, fp) != chunk) { // 将缓冲区数据写入 SD 卡
-                printf("[传输] 写SD失败: %s\n", file_name);
+                ESP_LOGE(TAG, "写SD失败: %s", file_name);
                 fclose(fp); fp = NULL;
                 err_code = 7; goto recv_exit;            // 报错：7闪
             }
             remain -= chunk;
         }
         fclose(fp); fp = NULL;                           // 一个文件写完，关闭文件句柄
-        printf("[传输] 已保存: %s\n", path);
+        
+        // ✅ [新增位置 6]：在文件写入成功并关闭后，打上"掉电可保存的序列号"标签，并缓存（每20次写入NVS一次）
+        if (s_cached_seq == 0) {
+            s_cached_seq = get_file_sequence();
+        }
+        uint64_t current_seq = s_cached_seq;
+        struct utimbuf new_times;
+        new_times.actime  = current_seq;
+        new_times.modtime = current_seq; // 将单调递增的序列号写入文件的修改时间属性中
+        utime(path, &new_times);
+        s_cached_seq++;       // 内存+1
+        s_write_counter++;    // 计数+1
+
+        // 每写满 20 个文件，才往 NVS 闪存提交一次（省电、防磨损）
+        if (s_write_counter >= NVS_COMMIT_INTERVAL) {
+            save_file_sequence(s_cached_seq);
+            s_write_counter = 0;
+        }
+
+        ESP_LOGI(TAG, "已保存: %s, 序列号: %llu", path, current_seq);
     }
 
     /* 🔴【灯语逻辑】：所有文件数据写完，熄灭长亮状态 */
@@ -452,16 +593,16 @@ static bool do_file_receive_after_handshake(int sock)
     {
         char done_buf[8] = {0};
         if (recv_all(sock, done_buf, 4) != 0) {          // 接收 4 字节
-            printf("[传输] 接收DONE失败\n");
+            ESP_LOGE(TAG, "接收DONE失败");
             err_code = 8; goto recv_exit;               // 报错：8闪
         }
         done_buf[4] = '\0';
         if (strncmp(done_buf, "DONE", 4) != 0) {         // 校验字符串是否为 "DONE"
-            printf("[传输] DONE包内容错误: %s\n", done_buf);
+            ESP_LOGE(TAG, "DONE包内容错误: %s", done_buf);
             err_code = 8; goto recv_exit;               // 报错：8闪
         }
         send(sock, "OK", 2, 0);                         // 向主端回复 "OK"，表示接收成功
-        printf("[传输] 完成，OK已发送\n");
+        ESP_LOGI(TAG, "完成，OK已发送");
         char drain[16]; recv(sock, drain, sizeof(drain), 0); // 读取主端发送的最后一个字节，等待主端关闭连接
     }
 
@@ -498,20 +639,20 @@ void app_main(void)
     g_sd_ok = (sd_ret == ESP_OK && sd_card != NULL);     // 记录 SD 卡是否初始化成功
 
     if (g_sd_ok) {
-        printf("[主函数] SD卡就绪\n");
+        ESP_LOGI(TAG, "SD卡就绪");
 #if USE_USB_MSC
         esp_err_t msc_ret = usb_msc_init(sd_card);       // 将 SD 卡注册到 TinyUSB 的 MSC 存储类中
         if (msc_ret != ESP_OK) {
-            printf("[主函数] USB MSC 初始化失败!\n");
+            ESP_LOGE(TAG, "USB MSC 初始化失败!");
             led_error_blink(1);                          /* 1闪 = 初始化失败 */
         } else {
             tud_connect();                               // 初始状态：USB 连接（电脑能看到 U 盘）
             vTaskDelay(pdMS_TO_TICKS(1000));             // 等待 1 秒让 Windows 加载驱动
-            printf("[主函数] USB MSC连接正常，U盘已挂载\n");
+            ESP_LOGI(TAG, "USB MSC连接正常，U盘已挂载");
         }
 #endif
     } else {
-        printf("[主函数] SD卡失败\n");
+        ESP_LOGE(TAG, "SD卡失败");
         led_error_blink(1);                              /* 1闪 = SD卡失败 */
     }
 
@@ -519,11 +660,10 @@ void app_main(void)
     wifi_init_sta();                                     // 注册事件回调、配置参数（不发起连接）
     esp_wifi_start();                                    // 启动 WiFi 驱动（触发 WIFI_EVENT_STA_START 事件，进而自动发起连接）
     vTaskDelay(pdMS_TO_TICKS(500));                      // 延时 500ms 让 WiFi 系统初始化稳定
-    setvbuf(stdout, NULL, _IONBF, 0);                    // 关闭 printf 的缓冲区，让串口日志立刻输出（对于调试至关重要）
     LED(0);                                              // 初始完毕后熄灭 LED，准备进入待机闪烁状态
 
-    printf("\n========== 从机 V3.6 (扫描不挂载模式) ==========\n");
-    printf("USB始终保持连接，后台持续扫描主端热点...\n");
+    ESP_LOGI(TAG, "========== 从机 V3.6 (扫描不挂载模式) ==========");
+    ESP_LOGI(TAG, "USB始终保持连接，后台持续扫描主端热点...");
 
     int trans_cnt = 0;                                   // 成功传输次数的统计
     int log_cnt   = 0;                                   // 用于控制日志打印频率的计数器
@@ -537,7 +677,7 @@ void app_main(void)
         /* --- 阶段1：WiFi 后台自动扫描与连接 ---
            如果 WiFi 没连上，代码不会往下走，防止 TCP 没网络盲连 */
         if (!wifi_is_connected()) {
-            if (++log_cnt >= 3) { log_cnt = 0; printf("[WiFi] 扫描中，U盘仍挂载...\n"); } // 每3秒打印一次，避免刷屏
+            if (++log_cnt >= 3) { log_cnt = 0; ESP_LOGI(TAG, "扫描中，U盘仍挂载..."); } // 每3秒打印一次，避免刷屏
             wifi_try_connect();                           // 尝试发起一次 WiFi 连接（内部非阻塞，带超时）
             vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_INTERVAL_MS)); // 无论连接是否成功，都等待 3 秒再重试
             continue;                                    // 直接跳入下一次循环
@@ -567,7 +707,7 @@ void app_main(void)
             continue;
         }
 
-        printf("[TCP] 已连接到主机！准备握手...\n");
+        ESP_LOGI(TAG, "已连接到主机！准备握手...");
         /* 🔴【灯语逻辑】：TCP连接成功，快闪3次提示，准备握手 */
         LED_BLINK(3, 100);
 
@@ -580,13 +720,13 @@ void app_main(void)
             // 主端会发来 11 字节的 "MASTER_SEND"
             int n = recv(sock, greeting, 11, MSG_WAITALL);
             if (n != 11 || strncmp(greeting, "MASTER_SEND", 11) != 0) { // 校验握手内容
-                printf("[握手] 握手失败，U盘保持连接\n");
+                ESP_LOGE(TAG, "握手失败，U盘保持连接");
                 led_error_blink(3);                        /* 3闪 = 握手失败 */
                 close(sock);
                 vTaskDelay(pdMS_TO_TICKS(TCP_POLL_INTERVAL_MS));
                 continue;
             }
-            printf("[握手] 收到 MASTER_SEND，立刻准备拔出U盘！\n");
+            ESP_LOGI(TAG, "收到 MASTER_SEND，立刻准备拔出U盘！");
 
             switch_to_wifi_mode();                         // 拔出 USB，挂载内部 FatFS
 
@@ -595,7 +735,7 @@ void app_main(void)
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ttv, sizeof(ttv));
 
             if (send(sock, "READY", 5, 0) != 5) {          // 告诉主端：我已经拔好 USB 准备好接收了
-                printf("[传输] 发READY失败\n");
+                ESP_LOGE(TAG, "发READY失败");
                 close(sock);
                 switch_to_usb_mode();                      // 如果发送失败，紧急恢复 USB
                 vTaskDelay(pdMS_TO_TICKS(TCP_POLL_INTERVAL_MS));
@@ -606,16 +746,24 @@ void app_main(void)
         /* --- 阶段4：核心文件接收 --- 
            此函数内部包含了长亮写文件的灯语逻辑 */
         bool ok = do_file_receive_after_handshake(sock);
-        close(sock);                                       // 关闭 TCP 连接
+        close(sock);
 
-        switch_to_usb_mode();                              // 接收完毕后，插回 USB
+        // ✅ 修复：把清理操作提前到 switch_to_usb_mode 之前，此时 FatFS 还处于挂载状态！
+        if (ok) {
+            ESP_LOGI(TAG, "文件接收成功，已完成%d次", ++trans_cnt);
+            
+            // 此时 SD 卡依然在 FatFS 控制下，可以成功检测空间并删除文件
+            check_and_clean_storage();
+        }
+
+        // ✅ 清理完成后，再执行插回 U 盘的逻辑
+        switch_to_usb_mode(); 
 
         if (ok) {
-            printf("[传输] 文件接收成功，已完成%d次\n", ++trans_cnt);
             vTaskDelay(pdMS_TO_TICKS(3000));               // 成功后，等待 3 秒再扫描下一次
         } else {
-            printf("[传输] 传输失败，冷却10秒...\n");
-            vTaskDelay(pdMS_TO_TICKS(10000));              // 失败后，冷却 10 秒防止电脑鬼畜反复弹窗
+            ESP_LOGW(TAG, "传输失败，冷却10秒...");
+            vTaskDelay(pdMS_TO_TICKS(10000));              // 失败后，冷却 10 秒
         }
     }
 }
