@@ -1,11 +1,10 @@
 /**
  ****************************************************************************************************
- * @file        main.c  (主端 - 绝对纯自动化版，无需触发文件)
+ * @file        main.c  (主端 - 纯AP强制发送版)
  * @author      ONE
  * @version     V3.9
  * @date        2026-06-29
- * @brief       绝对纯自动化 - 只要向U盘拷贝文件，检测写入结束且空闲3秒后，
- *              自动拔U盘，走WiFi发给从机。
+ * @brief       纯 AP 模式：启动即开热点，从机连上 TCP 端口后，无视从机状态，直接发送 SD 卡所有文件。
  ****************************************************************************************************
  */
 
@@ -51,7 +50,7 @@
 #define MAX_FILES           100
 #define FILE_SEND_BUF_SIZE  4096
 
-#define USB_IDLE_TIMEOUT_MS 3000  // USB底层连续空闲 3 秒视为传输结束
+#define USB_IDLE_TIMEOUT_MS 3000  // 保留，防止未使用变量警告
 
 // 🔴【灯语辅助宏】
 #define LED_BLINK(times, period_ms) for(int _i=0; _i<(times); _i++){ LED_TOGGLE(); vTaskDelay(pdMS_TO_TICKS((period_ms))); }
@@ -59,7 +58,7 @@
 // ======================== 全局状态变量 ========================
 static bool g_wifi_mode = false;
 
-// 原方案B的标记变量，需要靠第一步中修改底层 tinyusb_msc_storage.c 来赋值
+// 原方案B的标记变量，需要靠修改底层 tinyusb_msc_storage.c 来赋值
 // ✅ 修改后（全局可见）
 volatile bool g_usb_busy = false; 
 bool g_usb_written = false;       
@@ -77,7 +76,7 @@ static void handle_transfer(int client_sock);
 static void wifi_ap_start(void);
 static void wifi_ap_stop(void);
 
-// 纯自动化检测辅助函数
+// 纯自动化检测辅助函数（保留声明）
 static void wait_usb_idle_stable(uint32_t check_duration_ms);
 
 // ======================== 核心业务函数实现 ========================
@@ -194,23 +193,14 @@ static void wifi_ap_stop(void)
     }
 }
 
-// ======================== 文件传输逻辑与自动化检测 ========================
-
-// 等待 USB 底层持续空闲一定时长
+// 保留原函数，防止编译器告警
 static void wait_usb_idle_stable(uint32_t check_duration_ms)
 {
-    printf("[自动化] 检测到写入，等待USB底层传输完全停止...\n");
-    uint32_t stable_time = 0;
-    while (stable_time < check_duration_ms) {
-        if (g_usb_busy) {
-            stable_time = 0;      // 底层还在发数据，计时器归零
-        } else {
-            stable_time += 100;   // 空闲了 100ms
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    // 此函数在新版 AP 模式下已不再被调用
+    return;
 }
 
+// ======================== 核心修改：无握手、无ACK的暴力发送 ========================
 static void handle_transfer(int client_sock)
 {
     file_info_t *files = NULL;
@@ -231,18 +221,14 @@ static void handle_transfer(int client_sock)
         if (!has_file) { printf("[传输] SD无文件\n"); return; }
     }
 
-    // 【2. 设置 Socket 超时】
+    // 【2. 只设置发送超时，移除接收超时】
     struct timeval tv = { .tv_sec = TRANSFER_ACK_TIMEOUT, .tv_usec = 0 };
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); // 不等待接收
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));     // 发送失败自动超时断开
 
-    // 【3. 握手】
-    if (send_all(client_sock, "MASTER_SEND", 11) != 0) { printf("[传输] 握手失败\n"); return; }
-    char ack[16] = {0};
-    if (recv(client_sock, ack, 15, 0) <= 0 || strncmp(ack, "READY", 5) != 0) {
-        printf("[传输] 从机未就绪\n"); return;
-    }
-    printf("[传输] 从机就绪\n");
+    // 【3. 直接宣告，无视从机是否接受】
+    if (send_all(client_sock, "MASTER_SEND", 11) != 0) { printf("[传输] 连接异常\n"); return; }
+    printf("[传输] 宣告成功，无视从端状态，直接发送数据...\n");
 
     // 【4. 收集文件】
     files = malloc(sizeof(file_info_t) * MAX_FILES);
@@ -274,7 +260,7 @@ static void handle_transfer(int client_sock)
     // 【5. 发文件数】
     uint32_t cnt_net = htonl((uint32_t)file_cnt);
     send_all(client_sock, &cnt_net, 4);
-    printf("[传输] %d个文件\n", file_cnt);
+    printf("[传输] 向从机发送 %d 个文件\n", file_cnt);
 
     // 【6. 发文件】
     send_buf = malloc(FILE_SEND_BUF_SIZE);
@@ -320,69 +306,23 @@ static void handle_transfer(int client_sock)
             remain -= n;
         }
         fclose(fp);
-        printf("[传输] %s (%llu字节)\n", files[i].name, files[i].size);
+        printf("[传输] 发送完成: %s (%llu字节)\n", files[i].name, files[i].size);
     }
     LED(0);
 
-    // 【7. 发DONE等ACK】
+    // 【7. 发送结束标记 (只发送，不接收OK)】
     send_all(client_sock, "DONE", 4);
-    bool should_delete = false;
-    {
-        char a[16];
-        int retry = 0;
-        const int max_retries = 12;
-        const int wait_per_retry = 10;
-        struct timeval short_tv = { .tv_sec = wait_per_retry, .tv_usec = 0 };
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
-
-        bool ack_received = false;
-        while (retry < max_retries) {
-            memset(a, 0, sizeof(a));
-            int n = recv(client_sock, a, sizeof(a) - 1, 0);
-            if (n > 0) {
-                a[n] = '\0';
-                printf("[传输] 第 %d 次尝试收到 ACK: %s\n", retry + 1, a);
-                if (strncmp(a, "OK", 2) == 0) {
-                    should_delete = true;
-                    ack_received = true;
-                    break;
-                }
-            } else {
-                printf("[传输] 等待 ACK 超时 (%d/%d)\n", retry + 1, max_retries);
-            }
-            retry++;
-        }
-        struct timeval old_tv = { .tv_sec = TRANSFER_ACK_TIMEOUT, .tv_usec = 0 };
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &old_tv, sizeof(old_tv));
-    }
-
-    // 【8. 删除文件】
-    if (should_delete) {
-        printf("[传输] 删除SD文件...\n");
-        LED_BLINK(5, 100);
-        DIR *dir = opendir(SD_MOUNT_POINT);
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (entry->d_type == DT_REG) {
-                    char path[300];
-                    snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, entry->d_name);
-                    unlink(path);
-                }
-            }
-            closedir(dir);
-        }
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
+    printf("[传输] 所有数据已发出（未等待从机回复）\n");
+    // 不删除文件，确保主端数据安全
 
 cleanup:
-    free(send_buf);
-    free(files);
-    printf("[传输] 完成\n");
+    if (send_buf) free(send_buf);
+    if (files) free(files);
+    printf("[传输] 传输结束，释放连接\n");
 }
 
 
-// ======================== 主函数入口 ========================
+// ======================== 主函数入口 (纯 AP 模式) ========================
 void app_main(void)
 {
     // ======= 1. 基础系统与存储初始化 =======
@@ -394,7 +334,7 @@ void app_main(void)
     led_init();
     LED(1);
 
-    // ======= 2. SD 卡与 USB MSC 初始化 =======
+    // ======= 2. SD 卡与 USB MSC 初始化 (USB 仍然是U盘) =======
     sdmmc_card_t *sd_card = NULL;
     esp_err_t sd_ret = sd_card_init(&sd_card);
     bool sd_ok = (sd_ret == ESP_OK && sd_card != NULL);
@@ -405,117 +345,70 @@ void app_main(void)
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
         tud_connect();
         vTaskDelay(pdMS_TO_TICKS(1000));
-        printf("[主函数] USB MSC 就绪，PC可访问SD卡\n");
+        printf("[主函数] USB MSC 就绪，PC端依然可以通过USB拷贝文件到卡内\n");
 #endif
     } else {
         printf("[主函数] SD卡失败\n");
     }
 
-    // ======= 3. 日志与防误触初始化 =======
+    // ======= 3. 日志输出 =======
     vTaskDelay(pdMS_TO_TICKS(500));
     setvbuf(stdout, NULL, _IONBF, 0);
     LED(0);
 
-    printf("\n========== 主机 V3.9 (绝对纯自动化) ==========\n");
-    printf("U盘已就绪，只等电脑向U盘拷贝文件。\n");
+    printf("\n========== 主机 V3.9 (纯AP自动化版) ==========\n");
+    printf("永久开启热点，从机连接WiFi后自动触发下发文件。\n");
 
-    // 开机后等待10秒防误触（防止Windows刚识别时写入的卷标触发）
-    printf("[启动] 等待10秒防误触屏蔽期，请勿操作...\n");
-    vTaskDelay(pdMS_TO_TICKS(10000));
-    g_usb_written = false; // 强行消除系统刚开机时自动产生的误触发
+    // ======= 4. 直接开启 WiFi AP (常驻，不再关闭) =======
+    wifi_ap_start();
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    int trans_cnt = 0;
+    // ======= 5. 建立 TCP 监听服务 =======
+    int lsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock < 0) {
+        printf("[主端] 创建套接字失败\n");
+        return;
+    }
+    int opt = 1;
+    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(TRANSFER_PORT);
+    
+    if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(lsock);
+        printf("[主端] 端口绑定失败\n");
+        return;
+    }
+    listen(lsock, 1);
+    printf("[主端] TCP服务已启动，等待从机连接(端口%d)...\n", TRANSFER_PORT);
 
-    // ======= 4. 主循环 (绝对纯自动化事件轮询) =======
+    // ======= 6. 主循环：纯粹的 TCP 触发机制 =======
     while (1) {
         /* 🔴【灯语逻辑】：正常待机状态，1.2秒一个周期慢速翻转 */
         LED_TOGGLE();
         vTaskDelay(pdMS_TO_TICKS(800));
 
-        if (!g_wifi_mode) {
+        struct sockaddr_in cli;
+        socklen_t cl = sizeof(cli);
+        
+        // 阻塞式等待。只要从机连接上此端口，accept 就会立刻返回 > 0
+        int csock = accept(lsock, (struct sockaddr *)&cli, &cl);
+
+        if (csock > 0) {
+            printf("[触发] 从机已连接，立即开始下发文件！\n");
+            LED_BLINK(5, 100); // 闪烁提示正在传输
             
-            // 核心触发条件：【曾写入过数据】 + 【现在底层不忙】
-            if (g_usb_written && !g_usb_busy) {
-                
-                // 等到 USB 确确实实停下来了 3 秒钟，说明文件彻底传输结束
-                wait_usb_idle_stable(USB_IDLE_TIMEOUT_MS); 
-
-                printf("[自动化] 触发条件完全满足，自动开始传输！\n");
-                LED_BLINK(3, 100);
-
-                // 4.1 切换 WiFi 模式 (拔出 U 盘)
-                if (!switch_to_wifi_mode()) {
-                    printf("[自动化] 切模式失败\n");
-                    switch_to_usb_mode(); 
-                    continue;
-                }
-
-                // 4.2 检查真实文件是否存在
-                bool has_file = false;
-                DIR *dir = opendir(SD_MOUNT_POINT);
-                if (dir) {
-                    struct dirent *entry;
-                    while ((entry = readdir(dir)) != NULL) {
-                        if (entry->d_type == DT_REG) { 
-                            has_file = true; break; 
-                        }
-                    }
-                    closedir(dir);
-                }
-                if (!has_file) { 
-                    printf("[自动化] 无有效数据文件\n");
-                    switch_to_usb_mode(); 
-                    continue; 
-                }
-
-                // 4.3 启动 WiFi AP
-                printf("[自动化] 发现文件，启动WiFi热点...\n");
-                wifi_ap_start();
-
-                // 4.4 建立 TCP Socket (参照原逻辑)
-                int lsock = socket(AF_INET, SOCK_STREAM, 0); 
-                if (lsock < 0) { wifi_ap_stop(); switch_to_usb_mode(); continue; }
-                int opt = 1;
-                setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                struct sockaddr_in addr = {0};
-                addr.sin_family = AF_INET;
-                addr.sin_addr.s_addr = htonl(INADDR_ANY);
-                addr.sin_port = htons(TRANSFER_PORT);
-                if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-                    close(lsock); wifi_ap_stop(); switch_to_usb_mode(); continue;
-                }
-                listen(lsock, 1);
-                struct timeval tv = { .tv_sec = ACCEPT_TIMEOUT_S, .tv_usec = 0 };
-                setsockopt(lsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                printf("[自动化] 等待从机连接(超时%ds)...\n", ACCEPT_TIMEOUT_S);
-
-                struct sockaddr_in cli;
-                socklen_t cl = sizeof(cli);
-                int csock = accept(lsock, (struct sockaddr *)&cli, &cl);
-
-                if (csock < 0) {
-                    printf("[自动化] 从机连接超时\n");
-                } else {
-                    printf("[自动化] 从机已连接: %s\n", inet_ntoa(cli.sin_addr));
-                    handle_transfer(csock);
-                    close(csock);
-                    trans_cnt++;
-                }
-
-                close(lsock);
-                wifi_ap_stop();
-                switch_to_usb_mode();
-
-                // ======== 【绝对纯自动化专属收尾】 ========
-                // 1. 重置写入触发标记，等待下一次电脑接入
-                g_usb_written = false;
-                // 2. 给电脑 5 秒钟恢复枚举时间，防止刚插回去又马上触发
-                vTaskDelay(pdMS_TO_TICKS(5000));
-
-                printf("[自动化] 完成(共%d次传输)，等待下一次电脑写入文件\n", trans_cnt);
-                continue;
-            }
+            handle_transfer(csock); // 执行暴力无回复发送
+            
+            close(csock);
+            printf("[主端] 传输结束，继续等待下一次从机连接...\n");
+        } else {
+            // 极少出现，但若 accept 出错，等待 1 秒后重新进入监听
+            printf("[主端] Accept异常，重启监听\n");
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 }
