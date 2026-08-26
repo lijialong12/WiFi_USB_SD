@@ -41,9 +41,32 @@
 
 static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 
+/* 来自main.c的模式查询: true=WiFi网页模式(FATFS在ESP32本地), false=USB U盘模式(SD归PC独占) */
+extern bool app_in_wifi_mode(void);
+
 /* ======================== 全局变量 ======================== */
 static httpd_handle_t g_server = NULL;       /* HTTP服务器句柄: NULL=未启动, 非NULL=运行中 */
 static char g_base_path[16] = "/sd";         /* SD卡根路径: 所有文件访问均限制在此目录下 */
+
+/* 目录条目结构(供api_list_handler和排序比较器使用) */
+typedef struct {
+    char name[256];                                        /* 文件/目录名 */
+    bool is_dir;                                           /* true=目录, false=文件 */
+    uint64_t size;                                         /* 文件大小(字节), 目录为0 */
+    time_t mtime;                                          /* 修改时间(unix时间戳) */
+} entry_t;
+
+/**
+ * @brief       目录条目排序比较器(qsort用)
+ *              规则: 目录在前; 同类型按名称字母序(大小写不敏感)
+ */
+static int entry_cmp(const void *a, const void *b)
+{
+    const entry_t *ea = (const entry_t *)a;
+    const entry_t *eb = (const entry_t *)b;
+    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1;  /* 目录优先 */
+    return strcasecmp(ea->name, eb->name);                     /* 同类型按名称 */
+}
 
 /* ======================== MIME类型映射表 ======================== */
 /* 文件扩展名 → HTTP Content-Type 映射, 用于文件预览和下载 */
@@ -266,7 +289,8 @@ static bool validate_path(const char *path, char *normalized, size_t max_len)
 }
 
 /**
- * @brief       URL解码: 将 %XX 和 + 转为原始字符, 原地修改
+ * @brief       URL解码: 将 %XX 转为原始字符, 原地修改
+ * @note        不转换 '+': 本函数仅用于路径参数, 路径中的'+'是合法文件名字符
  * @param       str: 要解码的字符串(原地修改)
  */
 static void url_decode_inplace(char *str)
@@ -280,9 +304,6 @@ static void url_decode_inplace(char *str)
             char hex[3] = {src[1], src[2], '\0'};
             *dst++ = (char)strtol(hex, NULL, 16);
             src += 3;
-        } else if (*src == '+') {
-            *dst++ = ' ';
-            src++;
         } else {
             *dst++ = *src++;
         }
@@ -375,10 +396,20 @@ static esp_err_t api_list_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* ---- 步骤5: 遍历目录 (失败时尝试重新挂载) ---- */
+    /* ---- 步骤5: 遍历目录 (仅WiFi模式允许失败时重新挂载恢复) ---- */
     DIR *dir = opendir(norm_path);
     if (dir == NULL) {
-        /* 可能是USB弹出后TinyUSB未自动重新挂载, 尝试手动挂载一次 */
+        /* USB U盘模式下SD卡由PC独占, 此处强行本地挂载会导致PC端U盘
+         * 报"介质不存在"(test_unit_ready_cb在is_fat_mounted时返回NOT READY),
+         * 且主循环认为状态稳定不会纠正, 因此必须拒绝重挂载 */
+        if (!app_in_wifi_mode()) {
+            printf("[WEB_SRV] opendir failed & USB mode active - refuse remount\n");
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD\xE5\x8D\xA1\xE6\x9A\x82\xE6\x97\xB6\xE4\xB8\x8D\xE5\x8F\xAF\xE7\x94\xA8\xEF\xBC\x8C\xE8\xAF\xB7\xE5\x88\xB7\xE6\x96\xB0\xE9\xA1\xB5\xE9\x9D\xA2\xE9\x87\x8D\xE8\xAF\x95\",\"code\":\"SD_NOT_MOUNTED\"}");
+            return ESP_FAIL;
+        }
+        /* WiFi模式下可能是USB弹出后TinyUSB未自动重新挂载, 尝试手动挂载一次 */
         printf("[WEB_SRV] opendir failed, trying remount...\n");
         tinyusb_msc_storage_unmount();                              /* 先卸载清理残留状态 */
         esp_err_t remount_ret = tinyusb_msc_storage_mount("/sd");
@@ -396,13 +427,6 @@ static esp_err_t api_list_handler(httpd_req_t *req)
     }
 
     /* 收集条目到动态数组 (先收集后排序) */
-    typedef struct {
-        char name[256];                                        /* 文件/目录名 */
-        bool is_dir;                                           /* true=目录, false=文件 */
-        uint64_t size;                                         /* 文件大小(字节), 目录为0 */
-        time_t mtime;                                          /* 修改时间(unix时间戳) */
-    } entry_t;
-
     entry_t *entries = NULL;
     size_t entry_count = 0;
     size_t entry_cap = 64;                                     /* 初始容量 */
@@ -444,7 +468,14 @@ static esp_err_t api_list_handler(httpd_req_t *req)
             e->size   = e->is_dir ? 0 : st.st_size;
             e->mtime  = st.st_mtime;
         } else {
-            e->is_dir = (dp->d_type == DT_DIR);
+            /* stat失败时不用d_type判断(FATFS VFS下常为DT_UNKNOWN), 改用opendir探测 */
+            DIR *sub = opendir(full_path);
+            if (sub != NULL) {
+                e->is_dir = true;
+                closedir(sub);
+            } else {
+                e->is_dir = false;
+            }
             e->size   = 0;
             e->mtime  = 0;
         }
@@ -452,25 +483,8 @@ static esp_err_t api_list_handler(httpd_req_t *req)
     }
     closedir(dir);
 
-    /* ---- 步骤6: 排序 (目录在前字母序 → 文件在后字母序) ---- */
-    /* 冒泡排序 (条目数通常较小, 简单实现即可) */
-    for (size_t i = 0; i < entry_count; i++) {
-        for (size_t j = i + 1; j < entry_count; j++) {
-            bool swap = false;
-            /* 目录优先 */
-            if (entries[i].is_dir != entries[j].is_dir) {
-                if (!entries[i].is_dir) swap = true;           /* 文件在目录前 → 交换 */
-            } else {
-                /* 同类型按名称字母排序 */
-                if (strcasecmp(entries[i].name, entries[j].name) > 0) swap = true;
-            }
-            if (swap) {
-                entry_t tmp = entries[i];
-                entries[i] = entries[j];
-                entries[j] = tmp;
-            }
-        }
-    }
+    /* ---- 步骤6: 排序 (目录在前字母序 → 文件在后字母序, O(n·logn)) ---- */
+    qsort(entries, entry_count, sizeof(entry_t), entry_cmp);
 
     /* ---- 步骤7: 构建JSON响应 ---- */
     /* 预估大小: 每项约150字节, 加上外层结构 */
@@ -678,10 +692,11 @@ static esp_err_t api_file_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        /* 构建JSON前缀 */
+        /* 构建JSON前缀 (truncated: 文件超过预览上限被截断时为true, 前端可提示下载查看全文) */
         int prefix_len = snprintf(json_buf, json_buf_size,
-            "{\"ok\":true,\"path\":\"%s\",\"size\":%lld,\"type\":\"%s\",\"content\":\"",
-            norm_path, (long long)st.st_size, mime);
+            "{\"ok\":true,\"path\":\"%s\",\"size\":%lld,\"type\":\"%s\",\"truncated\":%s,\"content\":\"",
+            norm_path, (long long)st.st_size, mime,
+            ((off_t)st.st_size > (off_t)MAX_PREVIEW) ? "true" : "false");
 
         /* 转义文件内容并追加到JSON */
         char *dst = json_buf + prefix_len;
@@ -744,10 +759,8 @@ static esp_err_t api_file_handler(httpd_req_t *req)
         }
         httpd_resp_set_hdr(req, "Content-Disposition", cd_header);
 
-        /* 设置Content-Length */
-        char cl_header[32];
-        snprintf(cl_header, sizeof(cl_header), "%lld", (long long)st.st_size);
-        httpd_resp_set_hdr(req, "Content-Length", cl_header);
+        /* 注: 分块传输(httpd_resp_send_chunk)自动使用Transfer-Encoding: chunked,
+         * RFC 7230禁止与Content-Length同时出现, 因此不再手动设置Content-Length */
 
         /* 分块读取并发送文件内容 (每32KB让出一次CPU, 防止看门狗超时) */
         char chunk[2048];
@@ -770,6 +783,101 @@ static esp_err_t api_file_handler(httpd_req_t *req)
     }
 
     return ESP_OK;
+}
+
+/* ======================== 简易JSON字符串提取 ======================== */
+
+/**
+ * @brief       定位JSON中指定键的字符串值(返回值的首个引号位置)
+ *              逐个扫描完整字符串token: 键名必须整体匹配, 值内的转义引号不会干扰扫描,
+ *              避免了strstr方式"键名出现在其他键的值中导致误匹配"的问题
+ * @param       body: JSON文本
+ * @param       key: 键名(不含引号)
+ * @retval      指向值的起始引号; 未找到返回NULL
+ */
+static const char *json_find_string_value(const char *body, const char *key)
+{
+    const size_t klen = strlen(key);
+    const char *p = body;
+
+    while ((p = strchr(p, '"')) != NULL) {
+        p++;                                                    /* 跳过起始引号, p指向内容首字符 */
+        if (strncmp(p, key, klen) == 0 && p[klen] == '"') {     /* 键名整体匹配(如"password"不匹配"password2") */
+            const char *v = p + klen + 1;                       /* 跳过键名结束引号 */
+            while (*v == ' ' || *v == ':') v++;                 /* 跳过冒号和空白 */
+            return v;
+        }
+        /* 不是目标键: 跳过整个字符串(处理\"转义), 继续找下一个token */
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1] != '\0') p++;
+            p++;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief       从JSON中提取字符串值并解码转义序列
+ *              支持: \" \\ \/ \n \r \t \b \f \uXXXX(BMP基本多文种平面, 代理对丢弃)
+ * @param       body: JSON文本
+ * @param       key: 键名
+ * @param       out: 输出缓冲区(始终以'\0'结尾)
+ * @param       out_size: 缓冲区总大小
+ * @retval      true: 提取成功(含空串); false: 键不存在或值不是字符串
+ */
+static bool json_extract_string(const char *body, const char *key, char *out, size_t out_size)
+{
+    const char *v = json_find_string_value(body, key);
+    size_t o = 0;
+
+    if (v == NULL || *v != '"') return false;                   /* 值缺失或非字符串类型 */
+    v++;                                                        /* 跳过值的起始引号 */
+
+    while (*v && *v != '"' && o + 1 < out_size) {
+        char c = *v;
+        if (c == '\\' && v[1] != '\0') {
+            v++;                                                /* 指向转义字母 */
+            switch (*v) {
+            case '"':  c = '"';  break;
+            case '\\': c = '\\'; break;
+            case '/':  c = '/';  break;
+            case 'n':  c = '\n'; break;
+            case 'r':  c = '\r'; break;
+            case 't':  c = '\t'; break;
+            case 'b':  c = '\b'; break;
+            case 'f':  c = '\f'; break;
+            case 'u': {                                             /* \uXXXX → UTF-8 */
+                char hex[5] = {0};
+                unsigned long cp;
+                if (v[1] == '\0' || v[2] == '\0' || v[3] == '\0' || v[4] == '\0') return false;
+                memcpy(hex, v + 1, 4);                              /* 固定取4位hex, 防止strtol越界吞字符 */
+                cp = strtoul(hex, NULL, 16);
+                v += 4;                                             /* 移到最后一位hex上(循环尾部再统一++) */
+                if (cp < 0x80) {                                    /* 1字节 ASCII */
+                    if (o + 1 < out_size) out[o++] = (char)cp;
+                } else if (cp < 0x800) {                            /* 2字节 */
+                    if (o + 2 < out_size) {
+                        out[o++] = (char)(0xC0 | (cp >> 6));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                } else if (cp <= 0xFFFF && !(cp >= 0xD800 && cp <= 0xDFFF)) { /* 3字节(代理对区间丢弃) */
+                    if (o + 3 < out_size) {
+                        out[o++] = (char)(0xE0 | (cp >> 12));
+                        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                }
+                v++;
+                continue;                                           /* 已自行写入并前进, 跳过下方通用追加 */
+            }
+            default: c = *v; break;                                 /* 未知转义: 保留原字符 */
+            }
+        }
+        out[o++] = c;
+        v++;
+    }
+    out[o] = '\0';
+    return true;
 }
 
 /* ======================== WiFi配置API ======================== */
@@ -813,7 +921,7 @@ static esp_err_t save_wifi_config_to_nvs(const char *ssid, const char *password)
 
 /**
  * @brief       读取当前WiFi配置: GET /api/wifi-config
- *              密码脱敏返回(仅显示首尾字符)
+ *              密码明文返回(网页设置面板回显需要, 设备仅通过AP局域网访问)
  */
 static esp_err_t wifi_config_get_handler(httpd_req_t *req)
 {
@@ -864,43 +972,12 @@ static esp_err_t wifi_config_post_handler(httpd_req_t *req)
     body[received] = '\0';
     printf("[WEB_SRV] POST body: '%s'\n", body);
 
-    /* ---- 简易JSON解析: 提取ssid和password字段 ---- */
+    /* ---- JSON解析: 提取ssid和password字段(支持转义字符, 无跨键误匹配) ---- */
     char new_ssid[32] = {0};
     char new_pass[64] = {0};
 
-    /* 查找 "ssid" 字段 */
-    const char *ssid_key = strstr(body, "\"ssid\"");
-    if (ssid_key) {
-        const char *val_start = strchr(ssid_key, ':');
-        if (val_start) {
-            val_start++; /* 跳过冒号 */
-            while (*val_start == ' ' || *val_start == '"') val_start++; /* 跳过空格和引号 */
-            const char *val_end = strchr(val_start, '"');
-            if (val_end) {
-                size_t len = val_end - val_start;
-                if (len >= sizeof(new_ssid)) len = sizeof(new_ssid) - 1;
-                memcpy(new_ssid, val_start, len);
-                new_ssid[len] = '\0';
-            }
-        }
-    }
-
-    /* 查找 "password" 字段 */
-    const char *pass_key = strstr(body, "\"password\"");
-    if (pass_key) {
-        const char *val_start = strchr(pass_key, ':');
-        if (val_start) {
-            val_start++;
-            while (*val_start == ' ' || *val_start == '"') val_start++;
-            const char *val_end = strchr(val_start, '"');
-            if (val_end) {
-                size_t len = val_end - val_start;
-                if (len >= sizeof(new_pass)) len = sizeof(new_pass) - 1;
-                memcpy(new_pass, val_start, len);
-                new_pass[len] = '\0';
-            }
-        }
-    }
+    json_extract_string(body, "ssid", new_ssid, sizeof(new_ssid));      /* 缺失时为空串, 由下方校验拦截 */
+    json_extract_string(body, "password", new_pass, sizeof(new_pass));  /* 可选字段: 空串=开放网络 */
 
     /* ---- 校验 ---- */
     size_t ssid_len = strlen(new_ssid);

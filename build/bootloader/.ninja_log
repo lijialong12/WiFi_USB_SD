@@ -243,3 +243,16 @@
 9	65	8093524887311732	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
 8	60	8093525839639641	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
 8	60	8093525839639641	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+7	75	8094289718296433	esp-idf/esp_bootloader_format/CMakeFiles/__idf_esp_bootloader_format.dir/esp_bootloader_desc.c.obj	9e25ce8617e7823c
+75	128	8094289718975560	esp-idf/esp_bootloader_format/libesp_bootloader_format.a	7eb6fdf46ea71c6b
+128	253	8094289719497523	bootloader.elf	39618524ab1e45f4
+253	402	8094289722197425	.bin_timestamp	54324259f339b239
+253	402	8094289722197425	D:/Fork/WiFi_USB_SD/build/bootloader/.bin_timestamp	54324259f339b239
+402	456	8094289722238630	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+402	456	8094289722238630	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+8	61	8094302201347406	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+8	61	8094302201347406	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+7	61	8094307634310860	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+7	61	8094307634310860	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+8	61	8094307699207658	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91
+8	61	8094307699207658	D:/Fork/WiFi_USB_SD/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	2293c34885196f91

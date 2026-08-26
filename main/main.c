@@ -16,8 +16,8 @@
  * 硬件连接: SD_CLK=GPIO36, SD_CMD=GPIO35, SD_D0~D3=GPIO37/38/33/34
  *           USB_OTG: D-=GPIO19, D+=GPIO20
  *           LED: GPIO1
- * 工作流程: 上电 → LED亮 → 等待3秒USB枚举 → SD初始化 → USB MSC注册 →
- *           WiFi AP启动 → LED闪烁(慢闪=SD正常, 快闪=SD失败)
+ * 工作流程: 上电 → LED亮 → SD初始化 → USB MSC注册 → WiFi AP启动 →
+ *           Web服务器启动 → 主循环(模式切换防抖 + LED闪烁: 慢闪=SD正常, 快闪=SD失败)
  * @note
  *
  ****************************************************************************************************
@@ -61,16 +61,18 @@ static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_
 
 
 /* ======================== USB/WiFi 动态切换 ======================== */
-static int  g_sta_count       = 0;      /* 当前WiFi客户端数 */
+static volatile int g_sta_count = 0;    /* 当前WiFi客户端数(volatile: WiFi事件任务写/主循环读) */
 static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
-static int  g_stable_cnt      = 0;       /* 防抖计数器 */
+static int  g_stable_cnt      = 0;       /* 防抖计数器(可为负: 挂载失败退避) */
 #define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
-#define DEBOUNCE_USB   20                /* 断WiFi后等10秒切回U盘模式 (20×200ms) */
+#define DEBOUNCE_USB   20                /* 断WiFi后等4秒切回U盘模式 (20×200ms) */
 
 /**
  * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
+ * @retval      true: 切换成功(FATFS已挂载本地)
+ * @retval      false: 挂载失败(调用方应退避重试)
  */
-static void switch_to_wifi_mode(void)
+static bool switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
     printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
@@ -82,9 +84,12 @@ static void switch_to_wifi_mode(void)
     if (ret == ESP_OK) {
         g_wifi_mode = true;
         printf("[MODE] WiFi mode OK - web server can access SD\n");
-    } else {
-        printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
+        return true;
     }
+    printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
+    return false;
+#else
+    return true;
 #endif
 }
 
@@ -101,6 +106,16 @@ static void switch_to_usb_mode(void)
     tud_connect();                                  /* PC看到U盘插入 */
     printf("[MODE] USB mode OK - PC can access SD as USB drive\n");
 #endif
+}
+
+/**
+ * @brief       查询当前是否为WiFi网页模式(供web_server判断SD卡当前归属)
+ * @retval      true: WiFi网页模式(FATFS挂在ESP32本地, Web可访问)
+ * @retval      false: USB U盘模式(SD卡由PC通过USB MSC访问)
+ */
+bool app_in_wifi_mode(void)
+{
+    return g_wifi_mode;
 }
 
 /**
@@ -234,14 +249,14 @@ void app_main(void)
     LED(1);                                                             /* 点亮LED(高电平), 表示系统已上电启动 */
 
     /* ===== 阶段0.7: 等待USB Serial/JTAG枚举完成 ===== */
-    //vTaskDelay(pdMS_TO_TICKS(2000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
+    //vTaskDelay(pdMS_TO_TICKS(2000));                                    /* 已禁用以加快U盘出现速度; 若串口日志丢失可恢复此延时(2000ms) */
 
     /* ===== 阶段0.8: 重定向标准输出 ===== */
     setvbuf(stdout, NULL, _IONBF, 0);                                   /* 设置stdout为无缓冲模式(printf立即输出, 不掉数据) */
 
     /* 打印启动横幅 */
     printf("\n\n========== WiFi_USB_SD Starting ==========\n");         /* 输出启动分隔线和项目名称 */
-    printf("Chip: ESP32-S3 | SD: SDMMC 1-bit(CLK=36,CMD=35,D0=37)\n\n"); /* 输出芯片型号和SD卡引脚映射信息 */
+    printf("Chip: ESP32-S3 | SD: SDMMC 4-bit(CLK=36, CMD=35, D0~D3=37/38/33/34)\n\n"); /* 输出芯片型号和SD卡引脚映射信息 */
 
     /* ===== 阶段1: SD卡初始化(SDMMC 4-bit模式, 40MHz) ===== */
     printf("[MAIN] Step 1/3: SD card init...\n");                       /* 输出进度: 第1步SD卡初始化 */
@@ -306,8 +321,12 @@ void app_main(void)
                 /* 有人连WiFi → 想切到网页模式 */
                 g_stable_cnt++;
                 if (g_stable_cnt >= DEBOUNCE_WIFI) {
-                    switch_to_wifi_mode();
-                    g_stable_cnt = 0;
+                    if (switch_to_wifi_mode()) {
+                        g_stable_cnt = 0;
+                    } else {
+                        /* 挂载失败: 置负值退避, 再等一个完整防抖周期后重试, 避免高频刷屏 */
+                        g_stable_cnt = -DEBOUNCE_WIFI;
+                    }
                 }
             } else if (g_sta_count == 0 && g_wifi_mode) {
                 /* 没人连WiFi → 想切回U盘模式 */
