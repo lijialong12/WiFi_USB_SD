@@ -1,0 +1,10 @@
+CMake Error at C:/Espressif/frameworks/esp-idf-v5.4.1/tools/cmake/gdbinit.cmake:40 (file):
+  file FILE([TO_CMAKE_PATH|TO_NATIVE_PATH] path result) must be called with
+  exactly three arguments.
+Call Stack (most recent call first):
+  C:/Espressif/frameworks/esp-idf-v5.4.1/tools/cmake/project.cmake:356 (__generate_gdbinit)
+  C:/Espressif/frameworks/esp-idf-v5.4.1/tools/cmake/project.cmake:923 (__project_info)
+  CMakeLists.txt:8 (project)
+
+
+ninja: error: rebuilding 'build.ninja': subcommand failed

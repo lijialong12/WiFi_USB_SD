@@ -49,6 +49,8 @@
 #include "tusb_msc_storage.h"               /* TinyUSB MSC: mount/unmount状态 */
 #endif
 #include "web_server.h"                     /* Web文件服务器: HTTP文件管理API */
+#include "dns_server.h"                     /* DNS劫持服务器: 将所有域名解析到ESP32自身 */
+#include "dbg_log.h"                        /* SD卡文件日志: 串口与USB共用时通过F盘读日志 */
 
 
 /* ======================== WiFi AP 配置 ======================== */
@@ -65,7 +67,7 @@ static volatile int g_sta_count = 0;    /* 当前WiFi客户端数(volatile: WiFi
 static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
 static int  g_stable_cnt      = 0;       /* 防抖计数器(可为负: 挂载失败退避) */
 #define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
-#define DEBOUNCE_USB   20                /* 断WiFi后等4秒切回U盘模式 (20×200ms) */
+#define DEBOUNCE_USB   50                /* 断WiFi后等10秒切回U盘模式: 容忍网络抖动又不至于久等 */
 
 /**
  * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
@@ -76,6 +78,7 @@ static bool switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
     printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
+    dbg_log("MODE→WiFi enter (usb unmount + local mount)");
     tud_disconnect();                               /* PC看到U盘移除 */
     vTaskDelay(pdMS_TO_TICKS(800));                 /* 等PC处理断开 */
     /* 先卸载再挂载, 确保VFS/FATFS状态干净 (TinyUSB MSC层可能已部分卸载但is_fat_mounted仍为true) */
@@ -83,9 +86,11 @@ static bool switch_to_wifi_mode(void)
     esp_err_t ret = tinyusb_msc_storage_mount("/sd");
     if (ret == ESP_OK) {
         g_wifi_mode = true;
+        dbg_log("MODE→WiFi OK");
         printf("[MODE] WiFi mode OK - web server can access SD\n");
         return true;
     }
+    dbg_log("MODE→WiFi mount FAILED err=%s", esp_err_to_name(ret));
     printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
     return false;
 #else
@@ -100,10 +105,12 @@ static void switch_to_usb_mode(void)
 {
 #if USE_USB_MSC
     printf("[MODE] → USB mode (local unmount + USB connect)\n");
+    dbg_log("MODE→USB enter (wifi_mode=%d)", g_wifi_mode);
     tinyusb_msc_storage_unmount();
     g_wifi_mode = false;
     vTaskDelay(pdMS_TO_TICKS(300));
     tud_connect();                                  /* PC看到U盘插入 */
+    dbg_log("MODE→USB done");
     printf("[MODE] USB mode OK - PC can access SD as USB drive\n");
 #endif
 }
@@ -127,6 +134,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
         g_sta_count++;
+        /* 注意: 此处不加dbg_log — WiFi任务里做文件IO会与USB MSC争FATFS锁, 曾致任务看门狗复位 */
         ESP_LOGI(TAG, "station " MACSTR " join, AID=%d (total:%d)",
                  MAC2STR(e->mac), e->aid, g_sta_count);
     }
@@ -269,6 +277,7 @@ void app_main(void)
         printf("[MAIN] Step 2/3: USB MSC init + FATFS mount...\n");
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
         ESP_ERROR_CHECK(usb_msc_mount("/sd"));
+        dbg_log_boot();                                           /* SD已挂载: 记录复位原因(判断上次是否PANIC崩溃) */
         printf("[MAIN] USB MSC ready. PC→U盘 | 弹出U盘→WiFi访问\n");
 #else
         printf("[MAIN] Step 2/3: FATFS mount (direct)...\n");
@@ -286,8 +295,9 @@ void app_main(void)
     }
 
     /* ===== 阶段2: WiFi AP 初始化 ===== */
-    printf("[MAIN] Step 3/3: WiFi AP init...\n");                       /* 输出进度: 第3步WiFi AP初始化 */
+    printf("[MAIN] Step 3/3: WiFi AP init...\n");                 /* 输出进度: 第3步WiFi AP初始化 */
     wifi_init_softap();                                                 /* 启动WiFi SoftAP: SSID='BOSSCOM_USB_AP' */
+    dns_server_start();                                           /* DNS劫持必须在lwIP初始化后启动(内部会创建UDP53套接字), 将所有域名解析到192.168.4.1 */
     printf("[MAIN] WiFi AP: SSID='BOSSCOM_USB_AP' PASS='012345678'\n"); /* 输出WiFi AP的SSID和密码供用户连接 */
 
     /* ===== 阶段2.5: Web文件服务器启动 (端口80, http://192.168.4.1) ===== */

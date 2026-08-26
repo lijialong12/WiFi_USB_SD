@@ -1,0 +1,30 @@
+[0/1] Re-running CMake...
+-- Building ESP-IDF components for target esp32s3
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "espressif/tinyusb": "0.19.0~3" -> "0.21.0~1"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 3 dependencies:
+NOTICE: [1/3] espressif/esp_tinyusb (1.7.6~2)
+NOTICE: [2/3] espressif/tinyusb (0.19.0~3)
+NOTICE: [3/3] idf (5.4.1)
+-- Project sdkconfig file D:/Fork/WiFi_USB_SD/sdkconfig
+Loading defaults file D:/Fork/WiFi_USB_SD/sdkconfig.defaults...
+D:/Fork/WiFi_USB_SD/sdkconfig.defaults:4 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240 was replaced with CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 
+D:/Fork/WiFi_USB_SD/sdkconfig.defaults:5 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ was replaced with CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 
+D:/Fork/WiFi_USB_SD/sdkconfig.defaults:7 CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE was replaced with CONFIG_COMPILER_OPTIMIZATION_SIZE 
+-- Compiler supported targets: xtensa-esp-elf
+-- App "03_WiFi_AP" version: 3106772-dirty
+-- Adding linker script D:/Fork/WiFi_USB_SD/build/esp-idf/esp_system/ld/memory.ld
+-- Adding linker script D:/Fork/WiFi_USB_SD/build/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.api.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.bt_funcs.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.libgcc.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.wdt.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.version.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/esp_rom/esp32s3/ld/esp32s3.rom.newlib.ld
+-- Adding linker script C:/Espressif/frameworks/esp-idf-v5.4.1/components/soc/esp32s3/ld/esp32s3.peripherals.ld
+-- Configuring incomplete, errors occurred!
+FAILED: build.ninja 
+C:\Espressif\tools\cmake\3.30.2\bin\cmake.exe --regenerate-during-build -SD:\Fork\WiFi_USB_SD -BD:\Fork\WiFi_USB_SD\build

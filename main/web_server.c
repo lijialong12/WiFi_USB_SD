@@ -31,6 +31,7 @@
 #include "tusb_msc_storage.h"                /* TinyUSB MSC: tinyusb_msc_storage_mount */
 #include "nvs.h"                             /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
 #include "esp_system.h"                      /* ESP系统: esp_restart() */
+#include "esp_vfs_fat.h"                     /* FATFS VFS: esp_vfs_fat_info(查询剩余空间) */
 #include <stdio.h>                           /* 标准I/O: snprintf, fopen, fread, fclose */
 #include <stdlib.h>                          /* 标准库: malloc, free, realloc */
 #include <string.h>                          /* 字符串: strlen, strcpy, strchr, strcmp */
@@ -38,6 +39,7 @@
 #include <dirent.h>                          /* POSIX目录: opendir, readdir, closedir */
 #include <sys/stat.h>                        /* POSIX文件状态: stat, S_ISDIR */
 #include <strings.h>                         /* POSIX扩展字符串: strcasecmp */
+#include "dbg_log.h"                         /* SD卡文件日志: 串口与USB共用时通过F盘读日志 */
 
 static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 
@@ -322,7 +324,9 @@ static void url_decode_inplace(char *str)
 static esp_err_t root_handler(httpd_req_t *req)
 {
     printf("[WEB_SRV] >>> HANDLER: GET / (root)\n");
+    dbg_log("REQ GET /");                                       /* 页面加载到达日志 */
     httpd_resp_set_type(req, "text/html; charset=utf-8");       /* 设置响应Content-Type */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");       /* 禁用缓存: 保证浏览器每次加载最新页面JS */
     httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);    /* 发送嵌入HTML (字符串常量在Flash中) */
     printf("[WEB_SRV] <<< DONE: GET /\n");
     return ESP_OK;
@@ -342,6 +346,32 @@ static esp_err_t ping_handler(httpd_req_t *req)
 }
 
 /**
+ * @brief       Windows NCSI探测回应: GET /connecttest.txt / /redir.txt
+ *              Windows连接WiFi后会请求 www.msftconnecttest.com/connecttest.txt
+ *              来判断网络是否可用; 不回应则标记"无internet", Edge浏览器会阻止后续POST请求
+ *              返回 "Microsoft Connect Test" 即可通过Windows网络检测
+ */
+static esp_err_t ncsi_handler(httpd_req_t *req)
+{
+    const char *uri = req->uri;
+    /* 注意: 此处不加dbg_log — 探测高频触发会与USB MSC读卡争FATFS锁, 曾致任务看门狗复位 */
+    if (strstr(uri, "generate_204") || strstr(uri, "gen_204")) {
+        httpd_resp_set_status(req, "204 No Content");           /* Google系探测: 204=网络正常 */
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    if (strcmp(uri, "/hotspot-detect.html") == 0) {
+        httpd_resp_set_type(req, "text/html");                  /* Apple系探测: Success=网络正常 */
+        httpd_resp_sendstr(req, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+        return ESP_OK;
+    }
+    /* /connecttest.txt /redir.txt /redirect 及其他: 返回Windows期望的探测成功正文 */
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_sendstr(req, "Microsoft Connect Test");
+    return ESP_OK;
+}
+
+/**
  * @brief       目录列表API处理器: GET /api/list?path=/sd/subdir
  *              列出指定路径下的文件和子目录, 返回JSON数组
  *              目录在前(字母序), 文件在后(字母序)
@@ -351,6 +381,7 @@ static esp_err_t ping_handler(httpd_req_t *req)
 static esp_err_t api_list_handler(httpd_req_t *req)
 {
     printf("[WEB_SRV] >>> HANDLER: GET /api/list\n");
+    dbg_log("REQ LIST");                                        /* 目录列表到达日志 */
     char query[512] = {0};                                      /* 查询字符串缓冲区 */
     char raw_path[512] = {0};                                   /* 原始路径参数 */
     char norm_path[512] = {0};                                  /* 规范化后的安全路径 */
@@ -785,6 +816,158 @@ static esp_err_t api_file_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ======================== 文件上传API ======================== */
+
+/**
+ * @brief       丢弃请求中尚未读取的Body数据
+ *              必须在任何"不读Body就回错误包"的分支前调用:
+ *              否则服务器提前关闭连接时浏览器还在发送数据, 收到TCP RST后
+ *              只能显示"网络连接失败", 无法看到真实的JSON错误信息
+ * @param       req: HTTP请求对象
+ */
+static void drain_request_body(httpd_req_t *req)
+{
+    char sink[512];
+    while (httpd_req_recv(req, sink, sizeof(sink)) > 0) { }     /* 读到没有剩余数据为止 */
+}
+
+/**
+ * @brief       文件上传API处理器(分块): POST /api/upload?path=/sd/xxx/file.txt&offset=N
+ *              每次请求携带一个小数据块(≤4KB), offset指示写入偏移量
+ *              前端将大文件切成多个小块逐个POST, 避免单次大体积POST被浏览器/OS拦截
+ *              支持断点续传: offset>0时追加到已有文件对应位置
+ *              仅WiFi网页模式可用; 剩余空间不足时拒绝
+ * @param       req: HTTP请求对象
+ * @retval      ESP_OK: 本块写入成功(返回 {"ok":true,"next_offset":N})
+ */
+static esp_err_t api_upload_handler(httpd_req_t *req)
+{
+    /* 大缓冲一律static(httpd任务栈仅4KB, 局部数组曾致栈溢出→设备重启: 症状为U盘重现+WiFi掉线) */
+    static char query[512];
+    static char raw_path[512];
+    static char norm_path[512];
+    static char offset_str[16];
+    query[0] = raw_path[0] = norm_path[0] = offset_str[0] = '\0';
+
+    printf("[UPLOAD] >>> entry uri=%s content_len=%ld\n", req->uri, (long)req->content_len);
+    dbg_log("UP entry len=%ld", (long)req->content_len);
+
+    /* ---- 步骤1: 仅WiFi网页模式允许上传(与USB MSC互斥) ---- */
+    if (!app_in_wifi_mode()) {
+        drain_request_body(req);
+        printf("[UPLOAD] FAIL: not in wifi mode\n");
+        dbg_log("UP FAIL: not wifi mode");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD\xE5\x8D\xA1\xE6\x9A\x82\xE6\x97\xB6\xE4\xB8\x8D\xE5\x8F\xAF\xE7\x94\xA8\xEF\xBC\x8C\xE8\xAF\xB7\xE5\x88\xB7\xE6\x96\xB0\xE9\xA1\xB5\xE9\x9D\xA2\xE9\x87\x8D\xE8\xAF\x95\",\"code\":\"SD_NOT_MOUNTED\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 步骤2: 提取path + offset参数 ---- */
+    size_t query_len = httpd_req_get_url_query_len(req) + 1;
+    if (query_len > sizeof(query)) query_len = sizeof(query);
+    if (httpd_req_get_url_query_str(req, query, query_len) != ESP_OK ||
+        httpd_query_key_value(query, "path", raw_path, sizeof(raw_path)) != ESP_OK) {
+        drain_request_body(req);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Missing 'path' parameter\",\"code\":\"MISSING_PATH\"}");
+        return ESP_FAIL;
+    }
+    url_decode_inplace(raw_path);
+    if (!validate_path(raw_path, norm_path, sizeof(norm_path))) {
+        drain_request_body(req);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Invalid path\",\"code\":\"INVALID_PATH\"}");
+        return ESP_FAIL;
+    }
+
+    long long offset = 0;
+    if (httpd_query_key_value(query, "offset", offset_str, sizeof(offset_str)) == ESP_OK) {
+        offset = strtoll(offset_str, NULL, 10);
+        if (offset < 0) offset = 0;
+    }
+
+    /* ---- 步骤3: 目标不能是已存在的目录 ---- */
+    struct stat st;
+    if (stat(norm_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        drain_request_body(req);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Target is a directory\",\"code\":\"IS_DIR\"}");
+        return ESP_FAIL;
+    }
+
+    /* ---- 步骤4: 检查SD卡剩余空间(仅首块时检查) ---- */
+    if (offset == 0) {
+        uint64_t total_bytes = 0, free_bytes = 0;
+        if (esp_vfs_fat_info(g_base_path, &total_bytes, &free_bytes) == ESP_OK &&
+            (uint64_t)req->content_len >= free_bytes) {
+            drain_request_body(req);
+            httpd_resp_set_status(req, "507 Insufficient Storage");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"\xE5\x8D\xA1\xE4\xBD\x99\xE7\xA9\xBA\xE9\x97\xB4\xE4\xB8\x8D\xE8\xB6\xB3\",\"code\":\"NO_SPACE\"}");
+            return ESP_FAIL;
+        }
+    }
+
+    /* ---- 步骤5: 打开/创建文件, 写入本次数据块 ---- */
+    FILE *fp;
+    if (offset == 0) {
+        fp = fopen(norm_path, "wb");                              /* 首块: 创建/截断 */
+    } else {
+        fp = fopen(norm_path, "r+b");                             /* 续传: 读写打开 */
+    }
+    if (fp == NULL && offset > 0) {
+        fp = fopen(norm_path, "wb");                              /* 文件被删: 重建 */
+    }
+    if (fp == NULL) {
+        drain_request_body(req);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot open file for write");
+        return ESP_FAIL;
+    }
+    if (offset > 0) {
+        fseek(fp, offset, SEEK_SET);                              /* 定位到续传偏移 */
+    }
+
+    const size_t CHUNK = 4096;
+    static char buf[4096];                                        /* static: 同上, 避免httpd栈溢出 */
+    int rx;
+    long long written = 0;
+    while ((rx = httpd_req_recv(req, buf, sizeof(buf))) > 0) {
+        if (fwrite(buf, 1, (size_t)rx, fp) != (size_t)rx) {
+            fclose(fp);
+            drain_request_body(req);
+            printf("[UPLOAD] FAIL: SD write error at offset %lld\n", offset + written);
+            dbg_log("UP FAIL: sd write at %lld", offset + written);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD write failed");
+            return ESP_FAIL;
+        }
+        written += rx;
+    }
+    if (rx < 0) {
+        fclose(fp);
+        printf("[UPLOAD] FAIL: recv error rx=%d at written=%lld\n", rx, written);
+        dbg_log("UP FAIL: recv err rx=%d written=%lld", rx, written);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body receive failed");
+        return ESP_FAIL;
+    }
+
+    fclose(fp);
+
+    /* ---- 步骤6: 返回新的偏移量(前端据此发送下一块) ---- */
+    long long next_offset = offset + written;
+    printf("[UPLOAD] OK: wrote %lld bytes, next_offset=%lld\n", written, next_offset);
+    dbg_log("UP OK off=%lld wrote=%lld next=%lld", offset, written, next_offset);
+    char json[256];
+    snprintf(json, sizeof(json), "{\"ok\":true,\"next_offset\":%lld}", next_offset);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+
+    return ESP_OK;
+}
+
 /* ======================== 简易JSON字符串提取 ======================== */
 
 /**
@@ -1063,9 +1246,11 @@ esp_err_t web_server_start(void)
 
     /* ---- 创建HTTP服务器配置 ---- */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;                                /* 当前6个处理器(含2个wifi-config) */
+    config.max_uri_handlers = 16;                                /* 当前9个处理器(含2个wifi-config+1个upload+5个NCSI探测) */
     config.stack_size = 8192;                                   /* 8KB栈: 足够文件I/O操作 */
     config.server_port = 80;                                    /* 标准HTTP端口 */
+    config.recv_wait_timeout = 30;                              /* 接收超时延长到30s(默认5s): 上传大文件时网络波动容错 */
+    config.send_wait_timeout = 30;                              /* 发送超时延长到30s(默认5s): 慢客户端下载大文件容错 */
 
     /* ---- 启动服务器 ---- */
     esp_err_t ret = httpd_start(&g_server, &config);
@@ -1172,6 +1357,72 @@ esp_err_t web_server_start(void)
     }
     printf("[WEB_SRV] Registered: POST /api/wifi-config\n");
 
+    /* ---- 注册URI处理器: POST /api/upload (文件上传) ---- */
+    httpd_uri_t uri_upload = {
+        .uri       = "/api/upload",
+        .method    = HTTP_POST,
+        .handler   = api_upload_handler,
+        .user_ctx  = NULL
+    };
+    ret = httpd_register_uri_handler(g_server, &uri_upload);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register POST /api/upload handler");
+        httpd_stop(g_server);
+        g_server = NULL;
+        return ret;
+    }
+    printf("[WEB_SRV] Registered: POST /api/upload\n");
+
+    /* ---- 注册NCSI探测回应: Windows无网检测通过后Edge才允许POST请求 ---- */
+    httpd_uri_t uri_ncsi1 = {
+        .uri       = "/connecttest.txt",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi1);
+
+    httpd_uri_t uri_ncsi2 = {
+        .uri       = "/redir.txt",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi2);
+
+    httpd_uri_t uri_ncsi3 = {
+        .uri       = "/redirect",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi3);
+
+    httpd_uri_t uri_ncsi4 = {
+        .uri       = "/generate_204",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi4);
+
+    httpd_uri_t uri_ncsi5 = {
+        .uri       = "/gen_204",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi5);
+
+    httpd_uri_t uri_ncsi6 = {
+        .uri       = "/hotspot-detect.html",
+        .method    = HTTP_GET,
+        .handler   = ncsi_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(g_server, &uri_ncsi6);
+
+    printf("[WEB_SRV] Registered: NCSI probes (connecttest/redir/redirect/gen204/hotspot)\n");
     printf("[WEB_SRV] Web file server ready at http://192.168.4.1\n");
     ESP_LOGI(TAG, "Web file server started successfully");
     return ESP_OK;
