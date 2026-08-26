@@ -55,7 +55,7 @@
 static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 #define EXAMPLE_ESP_WIFI_SSID   "BOSSCOM_USB_AP"    /* WiFi AP热点名称(SSID) */
 #define EXAMPLE_ESP_WIFI_PASS   "012345678"         /* WiFi AP密码(至少8位) */
-#define EXAMPLE_MAX_STA_CONN    5                    /* AP最大同时连接客户端数 */
+#define EXAMPLE_MAX_STA_CONN    1                    /* AP最大同时连接客户端数 */
 #define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]  /* MAC地址拆分为6字节(用于printf) */
 #define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"                      /* MAC地址格式化字符串 */
 
@@ -234,7 +234,7 @@ void app_main(void)
     LED(1);                                                             /* 点亮LED(高电平), 表示系统已上电启动 */
 
     /* ===== 阶段0.7: 等待USB Serial/JTAG枚举完成 ===== */
-    vTaskDelay(pdMS_TO_TICKS(6000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
+    //vTaskDelay(pdMS_TO_TICKS(2000));                                    /* 延时3000ms, 让PC端完成USB串口驱动枚举 */
 
     /* ===== 阶段0.8: 重定向标准输出 ===== */
     setvbuf(stdout, NULL, _IONBF, 0);                                   /* 设置stdout为无缓冲模式(printf立即输出, 不掉数据) */
