@@ -45,6 +45,7 @@ static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP
 
 /* 来自main.c的模式查询: true=WiFi网页模式(FATFS在ESP32本地), false=USB U盘模式(SD归PC独占) */
 extern bool app_in_wifi_mode(void);
+extern void app_touch_http(void);   /* HTTP活动触点: 每个请求调用来刷新主循环的空闲超时 */
 
 /* ======================== 全局变量 ======================== */
 static httpd_handle_t g_server = NULL;       /* HTTP服务器句柄: NULL=未启动, 非NULL=运行中 */
@@ -323,6 +324,7 @@ static void url_decode_inplace(char *str)
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET / (root)\n");
     dbg_log("REQ GET /");                                       /* 页面加载到达日志 */
     httpd_resp_set_type(req, "text/html; charset=utf-8");       /* 设置响应Content-Type */
@@ -338,7 +340,7 @@ static esp_err_t root_handler(httpd_req_t *req)
  */
 static esp_err_t ping_handler(httpd_req_t *req)
 {
-    printf("[WEB_SRV] >>> HANDLER: GET /api/ping\n");
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"ping\":\"pong\"}");
     printf("[WEB_SRV] <<< DONE: GET /api/ping\n");
@@ -354,6 +356,7 @@ static esp_err_t ping_handler(httpd_req_t *req)
 static esp_err_t ncsi_handler(httpd_req_t *req)
 {
     const char *uri = req->uri;
+    app_touch_http();                                           /* NCSI探测也算HTTP活动(NCSI本身驱动空闲超时) */
     /* 注意: 此处不加dbg_log — 探测高频触发会与USB MSC读卡争FATFS锁, 曾致任务看门狗复位 */
     if (strstr(uri, "generate_204") || strstr(uri, "gen_204")) {
         httpd_resp_set_status(req, "204 No Content");           /* Google系探测: 204=网络正常 */
@@ -380,6 +383,7 @@ static esp_err_t ncsi_handler(httpd_req_t *req)
  */
 static esp_err_t api_list_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET /api/list\n");
     dbg_log("REQ LIST");                                        /* 目录列表到达日志 */
     char query[512] = {0};                                      /* 查询字符串缓冲区 */
@@ -610,6 +614,7 @@ static esp_err_t api_list_handler(httpd_req_t *req)
  */
 static esp_err_t api_file_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     char query[512] = {0};
     char raw_path[512] = {0};
     char action[32] = {0};
@@ -842,6 +847,7 @@ static void drain_request_body(httpd_req_t *req)
  */
 static esp_err_t api_upload_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时(含长时上传期间维持活动) */
     /* 大缓冲一律static(httpd任务栈仅4KB, 局部数组曾致栈溢出→设备重启: 症状为U盘重现+WiFi掉线) */
     static char query[512];
     static char raw_path[512];
@@ -1108,6 +1114,7 @@ static esp_err_t save_wifi_config_to_nvs(const char *ssid, const char *password)
  */
 static esp_err_t wifi_config_get_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET /api/wifi-config\n");
 
     char ssid[32] = "BOSSCOM_USB_AP";
@@ -1141,6 +1148,7 @@ static esp_err_t wifi_config_get_handler(httpd_req_t *req)
  */
 static esp_err_t wifi_config_post_handler(httpd_req_t *req)
 {
+    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: POST /api/wifi-config\n");
 
     /* ---- 读取POST body ---- */

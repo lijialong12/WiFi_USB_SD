@@ -36,6 +36,7 @@
 #include "freertos/task.h"                  /* FreeRTOS任务API: vTaskDelay */
 #include "freertos/event_groups.h"          /* FreeRTOS事件组: 任务同步(保留) */
 #include "esp_system.h"                     /* ESP32系统API: 芯片信息 */
+#include "esp_timer.h"                      /* 高精度定时器: esp_timer_get_time() HTTP空闲检测 */
 #include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
 #include "nvs_flash.h"                      /* NVS(非易失性存储) Flash: WiFi配置存储 */
 #include "nvs.h"                            /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
@@ -66,8 +67,16 @@ static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_
 static volatile int g_sta_count = 0;    /* 当前WiFi客户端数(volatile: WiFi事件任务写/主循环读) */
 static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
 static int  g_stable_cnt      = 0;       /* 防抖计数器(可为负: 挂载失败退避) */
+static int64_t g_last_http_us = 0;       /* 最后一次HTTP请求时间戳(微秒): WiFi断开事件丢失时的安全网 */
 #define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
 #define DEBOUNCE_USB   50                /* 断WiFi后等10秒切回U盘模式: 容忍网络抖动又不至于久等 */
+#define HTTP_IDLE_TIMEOUT_US 30000000LL  /* 30秒无HTTP请求→强制切回U盘(WiFi事件丢失安全网) */
+
+/**
+ * @brief       HTTP活动触点: 每次有请求到达时更新时间戳
+ *              供主循环检测WiFi客户端"假在线"(事件丢失)场景
+ */
+void app_touch_http(void) { g_last_http_us = esp_timer_get_time(); }
 
 /**
  * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
@@ -345,6 +354,13 @@ void app_main(void)
                     switch_to_usb_mode();
                     g_stable_cnt = 0;
                 }
+            } else if (g_wifi_mode &&
+                       (esp_timer_get_time() - g_last_http_us) > HTTP_IDLE_TIMEOUT_US) {
+                /* 安全网: WiFi断开事件丢失导致g_sta_count虚高>0, 但已30秒无任何HTTP请求
+                   判定客户端已离线, 强制切回U盘模式, 避免U盘长时间不弹出 */
+                printf("[MODE] HTTP idle 30s → force switch to USB mode\n");
+                switch_to_usb_mode();
+                g_stable_cnt = 0;
             } else {
                 g_stable_cnt = 0;  /* 状态稳定, 重置计数器 */
             }
