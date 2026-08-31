@@ -36,7 +36,6 @@
 #include "freertos/task.h"                  /* FreeRTOS任务API: vTaskDelay */
 #include "freertos/event_groups.h"          /* FreeRTOS事件组: 任务同步(保留) */
 #include "esp_system.h"                     /* ESP32系统API: 芯片信息 */
-#include "esp_timer.h"                      /* 高精度定时器: esp_timer_get_time() HTTP空闲检测 */
 #include "esp_log.h"                        /* ESP-IDF日志系统: ESP_LOGI/ESP_LOGE */
 #include "nvs_flash.h"                      /* NVS(非易失性存储) Flash: WiFi配置存储 */
 #include "nvs.h"                            /* NVS读写API: nvs_open/nvs_get_str/nvs_set_str */
@@ -51,7 +50,6 @@
 #endif
 #include "web_server.h"                     /* Web文件服务器: HTTP文件管理API */
 #include "dns_server.h"                     /* DNS劫持服务器: 将所有域名解析到ESP32自身 */
-#include "dbg_log.h"                        /* SD卡文件日志: 串口与USB共用时通过F盘读日志 */
 
 
 /* ======================== WiFi AP 配置 ======================== */
@@ -64,19 +62,38 @@ static const char *TAG = "AP";              /* 日志标签: 用于ESP_LOGI/ESP_
 
 
 /* ======================== USB/WiFi 动态切换 ======================== */
-static volatile int g_sta_count = 0;    /* 当前WiFi客户端数(volatile: WiFi事件任务写/主循环读) */
-static bool g_wifi_mode       = false;   /* true=WiFi网页模式, false=USB U盘模式 */
-static int  g_stable_cnt      = 0;       /* 防抖计数器(可为负: 挂载失败退避) */
-static int64_t g_last_http_us = 0;       /* 最后一次HTTP请求时间戳(微秒): WiFi断开事件丢失时的安全网 */
-#define DEBOUNCE_WIFI  15                /* 连WiFi后等3秒切到网页模式 (15×200ms) */
-#define DEBOUNCE_USB   50                /* 断WiFi后等10秒切回U盘模式: 容忍网络抖动又不至于久等 */
-#define HTTP_IDLE_TIMEOUT_US 30000000LL  /* 30秒无HTTP请求→强制切回U盘(WiFi事件丢失安全网) */
+static int  g_sta_count = 0;         /* 当前WiFi客户端数(主循环每轮读驱动, 精确) */
+static bool g_wifi_mode  = false;     /* true=WiFi网页模式, false=USB U盘模式 */
+static int  g_stable_cnt = 0;         /* 防抖计数器(连续多少轮同一状态才切换) */
+static volatile bool g_busy = false;  /* 忙标志: 上传/下载期间禁止切回U盘, 防止传输中断 */
+#define DEBOUNCE_WIFI  15             /* 检测到有WiFi连接后等3秒切到网页模式 (15×200ms) */
+#define DEBOUNCE_USB  50              /* 检测到无WiFi连接后等10秒切回U盘模式 (容忍抖动) */
 
 /**
- * @brief       HTTP活动触点: 每次有请求到达时更新时间戳
- *              供主循环检测WiFi客户端"假在线"(事件丢失)场景
+ * @brief       直接从WiFi驱动读取当前AP关联的station数量(真实连接数)
+ *              不依赖STACONNECTED/STADISCONNECTED事件——事件可能丢失导致计数虚高,
+ *              轮询驱动层最可靠: 只要有设备连着WiFi就返回>0, 断开即返回0
+ * @retval      >=0   当前在线station数
  */
-void app_touch_http(void) { g_last_http_us = esp_timer_get_time(); }
+static int read_sta_count(void)
+{
+    wifi_sta_list_t sta;
+    if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK) {
+        return 0;                                             /* 读失败按无客户端处理 */
+    }
+    return (int)sta.num;
+}
+
+/**
+ * @brief       设置/清除忙标志(供web_server在长时上传/文件操作期间调用)
+ *              忙期间主循环禁止切回U盘模式, 杜绝传输过程中U盘弹出
+ */
+void app_set_busy(bool busy) { g_busy = busy; }
+
+/**
+ * @brief       查询忙标志(web_server可据此决定是否继续)
+ */
+bool app_is_busy(void) { return g_busy; }
 
 /**
  * @brief       切换到WiFi网页模式: 断开USB MSC, 挂载FATFS到本地
@@ -87,7 +104,6 @@ static bool switch_to_wifi_mode(void)
 {
 #if USE_USB_MSC
     printf("[MODE] → WiFi mode (USB disconnect + local mount)\n");
-    dbg_log("MODE→WiFi enter (usb unmount + local mount)");
     tud_disconnect();                               /* PC看到U盘移除 */
     vTaskDelay(pdMS_TO_TICKS(800));                 /* 等PC处理断开 */
     /* 先卸载再挂载, 确保VFS/FATFS状态干净 (TinyUSB MSC层可能已部分卸载但is_fat_mounted仍为true) */
@@ -95,11 +111,9 @@ static bool switch_to_wifi_mode(void)
     esp_err_t ret = tinyusb_msc_storage_mount("/sd");
     if (ret == ESP_OK) {
         g_wifi_mode = true;
-        dbg_log("MODE→WiFi OK");
         printf("[MODE] WiFi mode OK - web server can access SD\n");
         return true;
     }
-    dbg_log("MODE→WiFi mount FAILED err=%s", esp_err_to_name(ret));
     printf("[MODE] WiFi mode mount FAILED: %s\n", esp_err_to_name(ret));
     return false;
 #else
@@ -114,12 +128,10 @@ static void switch_to_usb_mode(void)
 {
 #if USE_USB_MSC
     printf("[MODE] → USB mode (local unmount + USB connect)\n");
-    dbg_log("MODE→USB enter (wifi_mode=%d)", g_wifi_mode);
     tinyusb_msc_storage_unmount();
     g_wifi_mode = false;
     vTaskDelay(pdMS_TO_TICKS(300));
     tud_connect();                                  /* PC看到U盘插入 */
-    dbg_log("MODE→USB done");
     printf("[MODE] USB mode OK - PC can access SD as USB drive\n");
 #endif
 }
@@ -135,23 +147,21 @@ bool app_in_wifi_mode(void)
 }
 
 /**
- * @brief       WiFi事件处理回调: 仅统计客户端数量, 切换在main循环中做防抖
+ * @brief       WiFi事件处理回调: 仅打印日志, 供主循环参考
+ *              (station数量不再由事件累加——改为主循环每轮读驱动esp_wifi_ap_get_sta_list,
+ *               以规避事件丢失导致计数虚高的问题)
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
-        g_sta_count++;
-        /* 注意: 此处不加dbg_log — WiFi任务里做文件IO会与USB MSC争FATFS锁, 曾致任务看门狗复位 */
-        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d (total:%d)",
-                 MAC2STR(e->mac), e->aid, g_sta_count);
+        /* 注意: 此处只打印不做文件IO — 文件IO会与USB MSC争FATFS锁, 曾致任务看门狗复位 */
+        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d", MAC2STR(e->mac), e->aid);
     }
     else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)event_data;
-        if (g_sta_count > 0) g_sta_count--;
-        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d (total:%d)",
-                 MAC2STR(e->mac), e->aid, g_sta_count);
+        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d", MAC2STR(e->mac), e->aid);
     }
 }
 
@@ -286,7 +296,6 @@ void app_main(void)
         printf("[MAIN] Step 2/3: USB MSC init + FATFS mount...\n");
         ESP_ERROR_CHECK(usb_msc_init(sd_card));
         ESP_ERROR_CHECK(usb_msc_mount("/sd"));
-        dbg_log_boot();                                           /* SD已挂载: 记录复位原因(判断上次是否PANIC崩溃) */
         printf("[MAIN] USB MSC ready. PC→U盘 | 弹出U盘→WiFi访问\n");
 #else
         printf("[MAIN] Step 2/3: FATFS mount (direct)...\n");
@@ -334,8 +343,12 @@ void app_main(void)
         LED_TOGGLE();
 
 #if USE_USB_MSC
-        /* ---- 防抖切换逻辑 ---- */
+        /* ---- 模式切换: 直接以WiFi真实连接数为准 ----
+         * 有设备连WiFi → 切到网页模式(U盘脱离PC, 供上传/下载)
+         * 无设备连WiFi → 切回U盘模式(PC重新看到U盘)
+         * 每轮从驱动读取真实station数, 不依赖(可能丢失的)连接事件 */
         if (sd_ok) {
+            g_sta_count = read_sta_count();
             if (g_sta_count > 0 && !g_wifi_mode) {
                 /* 有人连WiFi → 想切到网页模式 */
                 g_stable_cnt++;
@@ -347,20 +360,14 @@ void app_main(void)
                         g_stable_cnt = -DEBOUNCE_WIFI;
                     }
                 }
-            } else if (g_sta_count == 0 && g_wifi_mode) {
-                /* 没人连WiFi → 想切回U盘模式 */
+            } else if (g_sta_count == 0 && g_wifi_mode && !g_busy) {
+                /* 没人连WiFi(驱动确认0已连接) → 切回U盘模式
+                   忙时(上传/下载进行中)不允许切, 防止传输中断 */
                 g_stable_cnt++;
                 if (g_stable_cnt >= DEBOUNCE_USB) {
                     switch_to_usb_mode();
                     g_stable_cnt = 0;
                 }
-            } else if (g_wifi_mode &&
-                       (esp_timer_get_time() - g_last_http_us) > HTTP_IDLE_TIMEOUT_US) {
-                /* 安全网: WiFi断开事件丢失导致g_sta_count虚高>0, 但已30秒无任何HTTP请求
-                   判定客户端已离线, 强制切回U盘模式, 避免U盘长时间不弹出 */
-                printf("[MODE] HTTP idle 30s → force switch to USB mode\n");
-                switch_to_usb_mode();
-                g_stable_cnt = 0;
             } else {
                 g_stable_cnt = 0;  /* 状态稳定, 重置计数器 */
             }

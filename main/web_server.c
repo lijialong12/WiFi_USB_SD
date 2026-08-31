@@ -39,13 +39,11 @@
 #include <dirent.h>                          /* POSIX目录: opendir, readdir, closedir */
 #include <sys/stat.h>                        /* POSIX文件状态: stat, S_ISDIR */
 #include <strings.h>                         /* POSIX扩展字符串: strcasecmp */
-#include "dbg_log.h"                         /* SD卡文件日志: 串口与USB共用时通过F盘读日志 */
-
 static const char *TAG = "WEB_SRV";          /* 日志标签: 用于ESP_LOGI/ESP_LOGE输出前缀 */
 
-/* 来自main.c的模式查询: true=WiFi网页模式(FATFS在ESP32本地), false=USB U盘模式(SD归PC独占) */
+/* 来自main.c的模式/忙查询: true=WiFi网页模式(FATFS在ESP32本地), false=USB U盘模式(SD归PC独占) */
 extern bool app_in_wifi_mode(void);
-extern void app_touch_http(void);   /* HTTP活动触点: 每个请求调用来刷新主循环的空闲超时 */
+extern void app_set_busy(bool busy);/* 忙标志: 长时上传/文件操作期间置位, 防止主循环切回U盘 */
 
 /* ======================== 全局变量 ======================== */
 static httpd_handle_t g_server = NULL;       /* HTTP服务器句柄: NULL=未启动, 非NULL=运行中 */
@@ -324,9 +322,7 @@ static void url_decode_inplace(char *str)
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET / (root)\n");
-    dbg_log("REQ GET /");                                       /* 页面加载到达日志 */
     httpd_resp_set_type(req, "text/html; charset=utf-8");       /* 设置响应Content-Type */
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");       /* 禁用缓存: 保证浏览器每次加载最新页面JS */
     httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);    /* 发送嵌入HTML (字符串常量在Flash中) */
@@ -340,7 +336,6 @@ static esp_err_t root_handler(httpd_req_t *req)
  */
 static esp_err_t ping_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"ping\":\"pong\"}");
     printf("[WEB_SRV] <<< DONE: GET /api/ping\n");
@@ -356,8 +351,7 @@ static esp_err_t ping_handler(httpd_req_t *req)
 static esp_err_t ncsi_handler(httpd_req_t *req)
 {
     const char *uri = req->uri;
-    app_touch_http();                                           /* NCSI探测也算HTTP活动(NCSI本身驱动空闲超时) */
-    /* 注意: 此处不加dbg_log — 探测高频触发会与USB MSC读卡争FATFS锁, 曾致任务看门狗复位 */
+    /* 注意: 此处不做文件IO — 探测高频触发会与USB MSC读卡争FATFS锁, 曾致任务看门狗复位 */
     if (strstr(uri, "generate_204") || strstr(uri, "gen_204")) {
         httpd_resp_set_status(req, "204 No Content");           /* Google系探测: 204=网络正常 */
         httpd_resp_send(req, NULL, 0);
@@ -383,9 +377,7 @@ static esp_err_t ncsi_handler(httpd_req_t *req)
  */
 static esp_err_t api_list_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET /api/list\n");
-    dbg_log("REQ LIST");                                        /* 目录列表到达日志 */
     char query[512] = {0};                                      /* 查询字符串缓冲区 */
     char raw_path[512] = {0};                                   /* 原始路径参数 */
     char norm_path[512] = {0};                                  /* 规范化后的安全路径 */
@@ -614,7 +606,6 @@ static esp_err_t api_list_handler(httpd_req_t *req)
  */
 static esp_err_t api_file_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     char query[512] = {0};
     char raw_path[512] = {0};
     char action[32] = {0};
@@ -799,12 +790,14 @@ static esp_err_t api_file_handler(httpd_req_t *req)
          * RFC 7230禁止与Content-Length同时出现, 因此不再手动设置Content-Length */
 
         /* 分块读取并发送文件内容 (每32KB让出一次CPU, 防止看门狗超时) */
+        app_set_busy(true);                                       /* 置忙: 下载传输期间禁止主循环切回U盘 */
         char chunk[2048];
         size_t bytes_read;
         int chunk_count = 0;
         while ((bytes_read = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
             if (httpd_resp_send_chunk(req, chunk, bytes_read) != ESP_OK) {
                 fclose(fp);
+                app_set_busy(false);
                 ESP_LOGW(TAG, "Client disconnected during download");
                 return ESP_FAIL;                               /* 客户端断开连接 */
             }
@@ -814,6 +807,7 @@ static esp_err_t api_file_handler(httpd_req_t *req)
         }
         httpd_resp_send_chunk(req, NULL, 0);                   /* 终止分块传输 */
         fclose(fp);
+        app_set_busy(false);
 
         ESP_LOGI(TAG, "GET /api/file?path=%s&action=download → 200 (%lld bytes)", norm_path, (long long)st.st_size);
     }
@@ -847,7 +841,6 @@ static void drain_request_body(httpd_req_t *req)
  */
 static esp_err_t api_upload_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时(含长时上传期间维持活动) */
     /* 大缓冲一律static(httpd任务栈仅4KB, 局部数组曾致栈溢出→设备重启: 症状为U盘重现+WiFi掉线) */
     static char query[512];
     static char raw_path[512];
@@ -856,13 +849,11 @@ static esp_err_t api_upload_handler(httpd_req_t *req)
     query[0] = raw_path[0] = norm_path[0] = offset_str[0] = '\0';
 
     printf("[UPLOAD] >>> entry uri=%s content_len=%ld\n", req->uri, (long)req->content_len);
-    dbg_log("UP entry len=%ld", (long)req->content_len);
 
     /* ---- 步骤1: 仅WiFi网页模式允许上传(与USB MSC互斥) ---- */
     if (!app_in_wifi_mode()) {
         drain_request_body(req);
         printf("[UPLOAD] FAIL: not in wifi mode\n");
-        dbg_log("UP FAIL: not wifi mode");
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD\xE5\x8D\xA1\xE6\x9A\x82\xE6\x97\xB6\xE4\xB8\x8D\xE5\x8F\xAF\xE7\x94\xA8\xEF\xBC\x8C\xE8\xAF\xB7\xE5\x88\xB7\xE6\x96\xB0\xE9\xA1\xB5\xE9\x9D\xA2\xE9\x87\x8D\xE8\xAF\x95\",\"code\":\"SD_NOT_MOUNTED\"}");
@@ -937,7 +928,8 @@ static esp_err_t api_upload_handler(httpd_req_t *req)
         fseek(fp, offset, SEEK_SET);                              /* 定位到续传偏移 */
     }
 
-    const size_t CHUNK = 4096;
+    app_set_busy(true);                                             /* 置忙: 阻塞在文件IO, 禁止主循环切回U盘 */
+
     static char buf[4096];                                        /* static: 同上, 避免httpd栈溢出 */
     int rx;
     long long written = 0;
@@ -945,8 +937,8 @@ static esp_err_t api_upload_handler(httpd_req_t *req)
         if (fwrite(buf, 1, (size_t)rx, fp) != (size_t)rx) {
             fclose(fp);
             drain_request_body(req);
+            app_set_busy(false);
             printf("[UPLOAD] FAIL: SD write error at offset %lld\n", offset + written);
-            dbg_log("UP FAIL: sd write at %lld", offset + written);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD write failed");
             return ESP_FAIL;
         }
@@ -954,8 +946,8 @@ static esp_err_t api_upload_handler(httpd_req_t *req)
     }
     if (rx < 0) {
         fclose(fp);
+        app_set_busy(false);
         printf("[UPLOAD] FAIL: recv error rx=%d at written=%lld\n", rx, written);
-        dbg_log("UP FAIL: recv err rx=%d written=%lld", rx, written);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body receive failed");
         return ESP_FAIL;
     }
@@ -964,8 +956,8 @@ static esp_err_t api_upload_handler(httpd_req_t *req)
 
     /* ---- 步骤6: 返回新的偏移量(前端据此发送下一块) ---- */
     long long next_offset = offset + written;
+    app_set_busy(false);
     printf("[UPLOAD] OK: wrote %lld bytes, next_offset=%lld\n", written, next_offset);
-    dbg_log("UP OK off=%lld wrote=%lld next=%lld", offset, written, next_offset);
     char json[256];
     snprintf(json, sizeof(json), "{\"ok\":true,\"next_offset\":%lld}", next_offset);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -1114,7 +1106,6 @@ static esp_err_t save_wifi_config_to_nvs(const char *ssid, const char *password)
  */
 static esp_err_t wifi_config_get_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: GET /api/wifi-config\n");
 
     char ssid[32] = "BOSSCOM_USB_AP";
@@ -1148,7 +1139,6 @@ static esp_err_t wifi_config_get_handler(httpd_req_t *req)
  */
 static esp_err_t wifi_config_post_handler(httpd_req_t *req)
 {
-    app_touch_http();                                           /* 刷新主循环HTTP空闲超时 */
     printf("[WEB_SRV] >>> HANDLER: POST /api/wifi-config\n");
 
     /* ---- 读取POST body ---- */
@@ -1459,3 +1449,5 @@ esp_err_t web_server_stop(void)
     }
     return ret;
 }
+
+
