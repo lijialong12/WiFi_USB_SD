@@ -1245,7 +1245,8 @@ esp_err_t web_server_start(void)
     /* ---- 创建HTTP服务器配置 ---- */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;                                /* 当前9个处理器(含2个wifi-config+1个upload+5个NCSI探测) */
-    config.stack_size = 8192;                                   /* 8KB栈: 足够文件I/O操作 */
+    config.stack_size = 24 * 1024;                              /* 24KB栈(原8KB): 上传/下载写FATFS+httpd_req_recv栈开销大,
+                                                                    8KB在连续大文件传输时栈溢出→panic→设备重启(WiFi掉线/"死掉") */
     config.server_port = 80;                                    /* 标准HTTP端口 */
     config.recv_wait_timeout = 30;                              /* 接收超时延长到30s(默认5s): 上传大文件时网络波动容错 */
     config.send_wait_timeout = 30;                              /* 发送超时延长到30s(默认5s): 慢客户端下载大文件容错 */

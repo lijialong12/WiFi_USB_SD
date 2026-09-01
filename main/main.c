@@ -66,8 +66,10 @@ static int  g_sta_count = 0;         /* 当前WiFi客户端数(主循环每轮�
 static bool g_wifi_mode  = false;     /* true=WiFi网页模式, false=USB U盘模式 */
 static int  g_stable_cnt = 0;         /* 防抖计数器(连续多少轮同一状态才切换) */
 static volatile bool g_busy = false;  /* 忙标志: 上传/下载期间禁止切回U盘, 防止传输中断 */
+static int  g_switch_cd = 0;          /* 切换冷却计数: 一次切换后若干轮内禁止再切换, 防乒乓 */
 #define DEBOUNCE_WIFI  15             /* 检测到有WiFi连接后等3秒切到网页模式 (15×200ms) */
-#define DEBOUNCE_USB  50              /* 检测到无WiFi连接后等10秒切回U盘模式 (容忍抖动) */
+#define DEBOUNCE_USB   15             /* 检测到无WiFi连接后等3秒切回U盘 (15×200ms) 用户要求的切换时间 */
+#define SWITCH_COOLDOWN 50            /* 切换冷却: 一次切换后10秒内禁止反向切换, 吸收无线网卡瞬时掉线防U盘莫名弹出 */
 
 /**
  * @brief       直接从WiFi驱动读取当前AP关联的station数量(真实连接数)
@@ -349,12 +351,16 @@ void app_main(void)
          * 每轮从驱动读取真实station数, 不依赖(可能丢失的)连接事件 */
         if (sd_ok) {
             g_sta_count = read_sta_count();
-            if (g_sta_count > 0 && !g_wifi_mode) {
+            if (g_switch_cd > 0) {
+                g_switch_cd--;                    /* 冷却期: 刚切换过, 暂不判断反向切换, 防乒乓 */
+                g_stable_cnt = 0;
+            } else if (g_sta_count > 0 && !g_wifi_mode) {
                 /* 有人连WiFi → 想切到网页模式 */
                 g_stable_cnt++;
                 if (g_stable_cnt >= DEBOUNCE_WIFI) {
                     if (switch_to_wifi_mode()) {
                         g_stable_cnt = 0;
+                        g_switch_cd = SWITCH_COOLDOWN;
                     } else {
                         /* 挂载失败: 置负值退避, 再等一个完整防抖周期后重试, 避免高频刷屏 */
                         g_stable_cnt = -DEBOUNCE_WIFI;
@@ -367,6 +373,7 @@ void app_main(void)
                 if (g_stable_cnt >= DEBOUNCE_USB) {
                     switch_to_usb_mode();
                     g_stable_cnt = 0;
+                    g_switch_cd = SWITCH_COOLDOWN;
                 }
             } else {
                 g_stable_cnt = 0;  /* 状态稳定, 重置计数器 */
